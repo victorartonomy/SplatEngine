@@ -1,6 +1,7 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <nfd.h>
@@ -201,6 +202,7 @@ int main() {
     int   frameCount = 0;
     double lastFPSTime = glfwGetTime();
     float  currentFPS  = 0.0f;
+    bool   firstLoop   = true;  // for initial dock layout
 
     std::cout << "[INFO] Editor ready — hold Right-Click in Viewport for camera control" << std::endl;
 
@@ -230,7 +232,28 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::DockSpaceOverViewport();
+        // --- Build initial dock layout once ---
+        ImGuiID dockspaceId = ImGui::DockSpaceOverViewport();
+        if (firstLoop) {
+            firstLoop = false;
+            ImGui::DockBuilderRemoveNode(dockspaceId);
+            ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
+            ImVec2 vpSize;
+            vpSize.x = static_cast<float>(WINDOW_WIDTH);
+            vpSize.y = static_cast<float>(WINDOW_HEIGHT);
+            ImGui::DockBuilderSetNodeSize(dockspaceId, vpSize);
+
+            ImGuiID dockLeft;
+            ImGuiID dockViewport = ImGui::DockBuilderSplitNode(
+                dockspaceId, ImGuiDir_Left, 0.25f, &dockLeft, nullptr);
+
+            // Viewport takes the large right area
+            ImGui::DockBuilderDockWindow("###Viewport", dockViewport);
+            // Left-side panels share one tab group
+            ImGui::DockBuilderDockWindow("Camera Settings", dockLeft);
+            ImGui::DockBuilderDockWindow("Asset Manager",   dockLeft);
+            ImGui::DockBuilderFinish(dockspaceId);
+        }
 
         // =============================================
         // VIEWPORT WINDOW
@@ -261,6 +284,8 @@ int main() {
             // --- Camera input (RMB + hover) ---
             bool vpHovered = ImGui::IsWindowHovered();
             bool rmbDown   = ImGui::IsMouseDown(ImGuiMouseButton_Right);
+            bool lmbDown   = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+            bool altDown   = io.KeyAlt;
 
             if (vpHovered && rmbDown) {
                 if (ImGui::IsKeyDown(ImGuiKey_W))
@@ -281,8 +306,25 @@ int main() {
                     camera.processMouseMovement(delta.x, -delta.y);
             }
 
+            // --- Camera rotate (Alt+LMB) ---
+            if (vpHovered && lmbDown && altDown) {
+                ImVec2 delta = io.MouseDelta;
+                if (delta.x != 0.0f || delta.y != 0.0f)
+                    camera.processMouseMovement(delta.x, -delta.y);
+            }
+
             if (vpHovered && io.MouseWheel != 0.0f)
                 camera.processMouseScroll(io.MouseWheel);
+
+            // --- Orbit (MMB drag) ---
+            bool mmbDown = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+            if (vpHovered && mmbDown) {
+                ImVec2 delta = io.MouseDelta;
+                if (delta.x != 0.0f || delta.y != 0.0f) {
+                    glm::vec3 pivot = meshLoaded ? meshCenter : glm::vec3(0.0f);
+                    camera.processOrbit(delta.x, -delta.y, pivot);
+                }
+            }
 
             // --- Display compute output (flip V for OpenGL origin) ---
             ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(outputTexture)),
@@ -306,7 +348,7 @@ int main() {
                 camera.setYaw(yaw);
 
             float pitch = camera.getPitch();
-            if (ImGui::SliderFloat("Pitch", &pitch, -89.0f, 89.0f))
+            if (ImGui::SliderFloat("Pitch", &pitch, -180.0f, 180.0f))
                 camera.setPitch(pitch);
 
             float fov = camera.getFOV();
@@ -354,6 +396,7 @@ int main() {
                 CameraState s;
                 s.name            = "Bookmark " + std::to_string(bookmarks.size() + 1);
                 s.position        = camera.getPosition();
+                s.orientation     = camera.getOrientation();
                 s.yaw             = camera.getYaw();
                 s.pitch           = camera.getPitch();
                 s.fov             = camera.getFOV();
@@ -367,8 +410,7 @@ int main() {
                 if (ImGui::Button("Load")) {
                     const auto& b = bookmarks[i];
                     camera.setPosition(b.position);
-                    camera.setYaw(b.yaw);
-                    camera.setPitch(b.pitch);
+                    camera.setOrientation(b.orientation);
                     camera.setFOV(b.fov);
                     camera.setMovementSpeed(b.movementSpeed);
                     camera.setMouseSensitivity(b.mouseSensitivity);
