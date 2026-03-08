@@ -1,0 +1,82 @@
+#version 430 core
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const int TILE_SIZE = 16;
+
+struct ProjectedTriangle {
+    vec2 v0;
+    vec2 v1;
+    vec2 v2;
+    
+    float depth0;
+    float depth1;
+    float depth2;
+    
+    ivec2 aabbMin;
+    ivec2 aabbMax;
+    
+    uint originalFaceIndex;
+    uint padding[3];
+};
+
+layout(std430, binding = 0) buffer ProjectedTriangleBuffer {
+    ProjectedTriangle projectedTriangles[];
+};
+
+layout(std430, binding = 1) buffer TileCounterBuffer {
+    uint tileCounters[];
+};
+
+layout(std430, binding = 2) buffer TileOffsetBuffer {
+    uint tileOffsets[];
+};
+
+layout(std430, binding = 3) buffer TriangleListBuffer {
+    uint triangleList[];
+};
+
+layout(std430, binding = 4) buffer TileWriteOffsetBuffer {
+    uint tileWriteOffsets[];
+};
+
+uniform ivec2 numTiles;
+uniform uint maxTriangleListSize;
+
+void main() {
+    uint triangleID = gl_GlobalInvocationID.x;
+    uint numTriangles = projectedTriangles.length();
+
+    if (triangleID >= numTriangles) {
+        return;
+    }
+
+    ProjectedTriangle tri = projectedTriangles[triangleID];
+
+    if (tri.aabbMin.x < 0) {
+        return;
+    }
+
+    ivec2 tileMin = tri.aabbMin / TILE_SIZE;
+    ivec2 tileMax = tri.aabbMax / TILE_SIZE;
+
+    tileMin = clamp(tileMin, ivec2(0), numTiles - ivec2(1));
+    tileMax = clamp(tileMax, ivec2(0), numTiles - ivec2(1));
+
+    for (int ty = tileMin.y; ty <= tileMax.y; ty++) {
+        for (int tx = tileMin.x; tx <= tileMax.x; tx++) {
+            uint tileIndex = ty * numTiles.x + tx;
+
+            uint tileBaseOffset = tileOffsets[tileIndex];
+
+            uint localOffset = atomicAdd(tileWriteOffsets[tileIndex], 1);
+
+            uint globalWriteIndex = tileBaseOffset + localOffset;
+
+            if (globalWriteIndex < maxTriangleListSize) {
+                triangleList[globalWriteIndex] = triangleID;
+            }
+        }
+    }
+}

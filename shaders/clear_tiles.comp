@@ -1,0 +1,17 @@
+#version 430 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer TileCounterBuffer {
+    uint tileCounters[];
+};
+
+uniform uint numElements;
+
+void main() {
+    uint globalID = gl_GlobalInvocationID.x;
+    
+    if (globalID < numElements) {
+        tileCounters[globalID] = 0;
+    }
+}

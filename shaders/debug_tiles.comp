@@ -1,0 +1,27 @@
+#version 430 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba32f, binding = 0) uniform image2D outputImage;
+
+uniform ivec2 screenSize;
+
+void main() {
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    
+    if (pixelCoords.x >= screenSize.x || pixelCoords.y >= screenSize.y) {
+        return;
+    }
+    
+    float x = float(pixelCoords.x) / float(screenSize.x);
+    float y = float(pixelCoords.y) / float(screenSize.y);
+    
+    vec4 color = vec4(x, y, 0.5, 1.0);
+    
+    ivec2 tileCoords = pixelCoords / 16;
+    if ((tileCoords.x + tileCoords.y) % 2 == 0) {
+        color.rgb *= 0.8;
+    }
+    
+    imageStore(outputImage, pixelCoords, color);
+}

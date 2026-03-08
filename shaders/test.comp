@@ -1,0 +1,30 @@
+#version 430 core
+
+// Define workgroup size (threads per workgroup)
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Output texture with read/write access
+layout(rgba32f, binding = 0) uniform image2D outputImage;
+
+void main() {
+    // Get pixel coordinates
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+
+    // Get image dimensions
+    ivec2 imageSize = imageSize(outputImage);
+
+    // Bounds check
+    if (pixelCoords.x >= imageSize.x || pixelCoords.y >= imageSize.y) {
+        return;
+    }
+
+    // Create a gradient pattern
+    // X axis: Red gradient (0.0 to 1.0)
+    // Y axis: Green gradient (0.0 to 1.0)
+    vec2 uv = vec2(pixelCoords) / vec2(imageSize);
+
+    vec4 color = vec4(uv.x, uv.y, 0.5, 1.0);  // Red-green gradient with blue = 0.5
+
+    // Write to output texture
+    imageStore(outputImage, pixelCoords, color);
+}

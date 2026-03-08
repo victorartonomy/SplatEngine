@@ -1,0 +1,9 @@
+# CMake / Ninja build output
+build/
+out/
+
+# Visual Studio local files
+.vs/
+
+# Large mesh data files
+models/*.off
