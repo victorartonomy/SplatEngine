@@ -85,6 +85,19 @@ void TileRasterizer::initialize(size_t maxTriangles) {
               << " entries (" << (triangleListSize / 1024 / 1024) << " MB)" << std::endl;
 }
 
+void TileRasterizer::resize(int newWidth, int newHeight, size_t maxTriangles) {
+    m_screenWidth = newWidth;
+    m_screenHeight = newHeight;
+    m_numTilesX = (newWidth + TileInfo::TILE_SIZE - 1) / TileInfo::TILE_SIZE;
+    m_numTilesY = (newHeight + TileInfo::TILE_SIZE - 1) / TileInfo::TILE_SIZE;
+    m_totalTiles = m_numTilesX * m_numTilesY;
+
+    initialize(maxTriangles);
+
+    std::cout << "[INFO] TileRasterizer resized: " << newWidth << "x" << newHeight
+              << " (" << m_numTilesX << "x" << m_numTilesY << " = " << m_totalTiles << " tiles)" << std::endl;
+}
+
 void TileRasterizer::pass1_countTrianglesPerTile(const glm::mat4& viewProjection, size_t triangleCount) {
     std::vector<GLuint> zeros(m_totalTiles, 0);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_tileCounterBuffer);

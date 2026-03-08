@@ -32,6 +32,47 @@ set(GLM_TEST_ENABLE OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glm)
 
 # ---------------------------------------------------------
+# Dear ImGui (docking branch)
+# ---------------------------------------------------------
+# ImGui has no CMakeLists.txt, so we fetch the source and build it manually.
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        docking
+)
+FetchContent_GetProperties(imgui)
+if(NOT imgui_POPULATED)
+    FetchContent_Populate(imgui)
+endif()
+
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_include_directories(imgui PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+# ImGui's GLFW backend needs GLFW headers; it uses its own minimal GL loader internally.
+target_link_libraries(imgui PUBLIC glfw)
+
+# ---------------------------------------------------------
+# Native File Dialog Extended (OS-native open/save dialogs)
+# ---------------------------------------------------------
+FetchContent_Declare(
+    nfd
+    GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended.git
+    GIT_TAG        v1.2.1
+)
+set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(nfd)
+
+# ---------------------------------------------------------
 # Project Targets
 # ---------------------------------------------------------
 
@@ -43,7 +84,6 @@ target_include_directories(glad PUBLIC include)
 add_executable(Engine 
     src/main.cpp
     src/ComputeShader.cpp
-    src/Shader.cpp
     src/COFFParser.cpp
     src/GPUBuffer.cpp
     src/Camera.cpp
@@ -58,6 +98,8 @@ target_link_libraries(Engine PRIVATE
     glfw
     glm
     glad
+    imgui
+    nfd
 )
 
 # ---------------------------------------------------------

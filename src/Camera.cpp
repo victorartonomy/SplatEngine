@@ -81,6 +81,20 @@ void Camera::processMouseScroll(float yOffset) {
     m_fov = std::clamp(m_fov, 1.0f, 90.0f);
 }
 
+void Camera::setYaw(float yaw) {
+    m_yaw = yaw;
+    updateCameraVectors();
+}
+
+void Camera::setPitch(float pitch) {
+    m_pitch = std::clamp(pitch, -89.0f, 89.0f);
+    updateCameraVectors();
+}
+
+void Camera::setFOV(float fov) {
+    m_fov = std::clamp(fov, 1.0f, 90.0f);
+}
+
 void Camera::updateCameraVectors() {
     glm::vec3 front;
     front.x = cos(glm::radians(m_yaw)) * cos(glm::radians(m_pitch));

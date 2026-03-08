@@ -31,10 +31,19 @@ public:
     glm::vec3 getPosition() const { return m_position; }
     glm::vec3 getFront() const { return m_front; }
     float getFOV() const { return m_fov; }
+    float getYaw() const { return m_yaw; }
+    float getPitch() const { return m_pitch; }
+    float getMovementSpeed() const { return m_movementSpeed; }
+    float getMouseSensitivity() const { return m_mouseSensitivity; }
+    float getNearPlane() const { return m_nearPlane; }
+    float getFarPlane() const { return m_farPlane; }
 
     void setPosition(const glm::vec3& position) { m_position = position; }
     void setMovementSpeed(float speed) { m_movementSpeed = speed; }
     void setMouseSensitivity(float sensitivity) { m_mouseSensitivity = sensitivity; }
+    void setYaw(float yaw);
+    void setPitch(float pitch);
+    void setFOV(float fov);
     void lookAt(const glm::vec3& target);
 
 private:
