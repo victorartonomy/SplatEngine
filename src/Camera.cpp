@@ -1,9 +1,11 @@
 #include "Camera.h"
 #include <algorithm>
+#include <glm/gtx/quaternion.hpp>
 
 Camera::Camera(glm::vec3 position, glm::vec3 up, float yaw, float pitch)
     : m_position(position)
     , m_worldUp(up)
+    , m_orientation(glm::quat(glm::vec3(glm::radians(-pitch), glm::radians(-yaw), 0.0f)))
     , m_yaw(yaw)
     , m_pitch(pitch)
     , m_front(glm::vec3(0.0f, 0.0f, -1.0f))
@@ -55,39 +57,79 @@ void Camera::processKeyboard(CameraMovement direction, float deltaTime) {
 
 void Camera::lookAt(const glm::vec3& target) {
     glm::vec3 direction = glm::normalize(target - m_position);
-
-    m_pitch = glm::degrees(asin(direction.y));
-    m_yaw = glm::degrees(atan2(direction.z, direction.x));
-
+    // Robust up vector: if direction is parallel to up, use fallback
+    glm::vec3 up = m_worldUp;
+    if (glm::abs(glm::dot(direction, up)) > 0.999f) {
+        up = glm::vec3(0, 0, 1);
+        if (glm::abs(glm::dot(direction, up)) > 0.999f)
+            up = glm::vec3(1, 0, 0);
+    }
+    m_orientation = glm::quatLookAt(direction, up);
     updateCameraVectors();
 }
 
-void Camera::processMouseMovement(float xOffset, float yOffset, bool constrainPitch) {
+void Camera::processMouseMovement(float xOffset, float yOffset, bool /*constrainPitch*/) {
     xOffset *= m_mouseSensitivity;
     yOffset *= m_mouseSensitivity;
 
-    m_yaw += xOffset;
-    m_pitch += yOffset;
-
-    if (constrainPitch) {
-        m_pitch = std::clamp(m_pitch, -89.0f, 89.0f);
-    }
-
+    // Yaw (Y axis), Pitch (X axis)
+    glm::quat qPitch = glm::angleAxis(glm::radians(-yOffset), glm::vec3(1, 0, 0));
+    glm::quat qYaw   = glm::angleAxis(glm::radians(-xOffset), glm::vec3(0, 1, 0));
+    m_orientation = qYaw * m_orientation;
+    m_orientation = m_orientation * qPitch;
+    m_orientation = glm::normalize(m_orientation);
     updateCameraVectors();
 }
 
 void Camera::processMouseScroll(float yOffset) {
-    m_fov -= yOffset;
-    m_fov = std::clamp(m_fov, 1.0f, 90.0f);
+    // Scroll wheel adjusts movement speed (multiplicative for natural feel)
+    float factor = (yOffset > 0.0f) ? 1.1f : 1.0f / 1.1f;
+    m_movementSpeed *= factor;
+    m_movementSpeed = std::clamp(m_movementSpeed, 1.0f, 10000.0f);
+}
+
+void Camera::processOrbit(float xOffset, float yOffset, const glm::vec3& pivot) {
+    xOffset *= m_mouseSensitivity;
+    yOffset *= m_mouseSensitivity;
+
+    // Calculate vector from pivot to camera
+    glm::vec3 toCam = m_position - pivot;
+    float radius = glm::length(toCam);
+    if (radius < 1e-4f) radius = 1.0f;
+    glm::quat qPitch = glm::angleAxis(glm::radians(-yOffset), glm::vec3(1, 0, 0));
+    glm::quat qYaw   = glm::angleAxis(glm::radians(-xOffset), glm::vec3(0, 1, 0));
+    glm::quat rot = qYaw * qPitch;
+    toCam = rot * toCam;
+    m_position = pivot + toCam;
+    // Look at the pivot (robust up)
+    glm::vec3 direction = glm::normalize(pivot - m_position);
+    glm::vec3 up = m_worldUp;
+    if (glm::abs(glm::dot(direction, up)) > 0.999f) {
+        up = glm::vec3(0, 0, 1);
+        if (glm::abs(glm::dot(direction, up)) > 0.999f)
+            up = glm::vec3(1, 0, 0);
+    }
+    m_orientation = glm::quatLookAt(direction, up);
+    updateCameraVectors();
 }
 
 void Camera::setYaw(float yaw) {
     m_yaw = yaw;
+    // Rebuild orientation from yaw/pitch
+    glm::quat qPitch = glm::angleAxis(glm::radians(-m_pitch), glm::vec3(1, 0, 0));
+    glm::quat qYaw   = glm::angleAxis(glm::radians(-m_yaw), glm::vec3(0, 1, 0));
+    m_orientation = qYaw * qPitch;
+    m_orientation = glm::normalize(m_orientation);
     updateCameraVectors();
 }
 
 void Camera::setPitch(float pitch) {
-    m_pitch = std::clamp(pitch, -89.0f, 89.0f);
+    m_pitch = pitch;
+    // Rebuild orientation from yaw/pitch
+    glm::quat qPitch = glm::angleAxis(glm::radians(-m_pitch), glm::vec3(1, 0, 0));
+    glm::quat qYaw   = glm::angleAxis(glm::radians(-m_yaw), glm::vec3(0, 1, 0));
+    m_orientation = qYaw * qPitch;
+    m_orientation = glm::normalize(m_orientation);
     updateCameraVectors();
 }
 
@@ -96,12 +138,11 @@ void Camera::setFOV(float fov) {
 }
 
 void Camera::updateCameraVectors() {
-    glm::vec3 front;
-    front.x = cos(glm::radians(m_yaw)) * cos(glm::radians(m_pitch));
-    front.y = sin(glm::radians(m_pitch));
-    front.z = sin(glm::radians(m_yaw)) * cos(glm::radians(m_pitch));
-    
-    m_front = glm::normalize(front);
-    m_right = glm::normalize(glm::cross(m_front, m_worldUp));
-    m_up = glm::normalize(glm::cross(m_right, m_front));
+    m_front = m_orientation * glm::vec3(0.0f, 0.0f, -1.0f);
+    m_right = m_orientation * glm::vec3(1.0f, 0.0f, 0.0f);
+    m_up    = m_orientation * glm::vec3(0.0f, 1.0f, 0.0f);
+    // Keep yaw/pitch in sync with quaternion for UI/bookmarks
+    glm::vec3 euler = glm::eulerAngles(m_orientation);
+    m_pitch = -glm::degrees(euler.x);
+    m_yaw   = -glm::degrees(euler.y);
 }
