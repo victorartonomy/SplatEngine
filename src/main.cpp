@@ -243,15 +243,19 @@ int main() {
             vpSize.y = static_cast<float>(WINDOW_HEIGHT);
             ImGui::DockBuilderSetNodeSize(dockspaceId, vpSize);
 
-            ImGuiID dockLeft;
-            ImGuiID dockViewport = ImGui::DockBuilderSplitNode(
-                dockspaceId, ImGuiDir_Left, 0.25f, &dockLeft, nullptr);
+            ImGuiID dockLeft = 0, dockRight = 0, dockRightTop = 0, dockRightBottom = 0;
+            // Split: left 75% (viewport), right 25%
+            ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.75f, &dockLeft, &dockRight);
+            // Split right: top 50% (asset), bottom 50% (camera/mouse)
+            ImGui::DockBuilderSplitNode(dockRight, ImGuiDir_Up, 0.5f, &dockRightTop, &dockRightBottom);
 
-            // Viewport takes the large right area
-            ImGui::DockBuilderDockWindow("###Viewport", dockViewport);
-            // Left-side panels share one tab group
-            ImGui::DockBuilderDockWindow("Camera Settings", dockLeft);
-            ImGui::DockBuilderDockWindow("Asset Manager",   dockLeft);
+            // Viewport on the left
+            ImGui::DockBuilderDockWindow("###Viewport", dockLeft);
+            // Asset Manager on right top
+            ImGui::DockBuilderDockWindow("Asset Manager", dockRightTop);
+            // Camera and Mouse tabbed together on right bottom
+            ImGui::DockBuilderDockWindow("Camera Settings", dockRightBottom);
+            ImGui::DockBuilderDockWindow("Mouse", dockRightBottom);
             ImGui::DockBuilderFinish(dockspaceId);
         }
 
