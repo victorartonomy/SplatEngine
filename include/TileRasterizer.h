@@ -14,6 +14,7 @@ public:
     TileRasterizer& operator=(const TileRasterizer&) = delete;
 
     void initialize(size_t maxTriangles);
+    void resize(int newWidth, int newHeight, size_t maxTriangles);
     void pass1_countTrianglesPerTile(const glm::mat4& viewProjection, size_t triangleCount);
     size_t pass2_prefixSum();
     void pass3_binTriangles(size_t triangleCount);
