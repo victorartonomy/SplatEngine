@@ -1,0 +1,139 @@
+#version 430 core
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+const int TILE_SIZE = 16;
+
+layout(rgba32f, binding = 0) uniform image2D outputImage;
+layout(r32ui, binding = 1) coherent uniform uimage2D depthBuffer;
+
+struct Vertex {
+    vec3 position;
+    vec3 padding;
+};
+
+struct Face {
+    uvec3 indices;
+    vec3 color;
+    float padding;
+};
+
+struct ProjectedTriangle {
+    vec2 v0;
+    vec2 v1;
+    vec2 v2;
+    
+    float depth0;
+    float depth1;
+    float depth2;
+    
+    ivec2 aabbMin;
+    ivec2 aabbMax;
+    
+    uint originalFaceIndex;
+    uint padding[3];
+};
+
+layout(std430, binding = 2) buffer VertexBuffer {
+    Vertex vertices[];
+};
+
+layout(std430, binding = 3) buffer FaceBuffer {
+    Face faces[];
+};
+
+layout(std430, binding = 4) buffer ProjectedTriangleBuffer {
+    ProjectedTriangle projectedTriangles[];
+};
+
+layout(std430, binding = 5) buffer TileOffsetBuffer {
+    uint tileOffsets[];
+};
+
+layout(std430, binding = 6) buffer TriangleListBuffer {
+    uint triangleList[];
+};
+
+uniform ivec2 screenSize;
+uniform ivec2 numTiles;
+
+float sign(vec2 p1, vec2 p2, vec2 p3) {
+    return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+}
+
+bool pointInTriangle(vec2 pt, vec2 v0, vec2 v1, vec2 v2, out vec3 barycentric) {
+    float d1 = sign(pt, v0, v1);
+    float d2 = sign(pt, v1, v2);
+    float d3 = sign(pt, v2, v0);
+
+    bool hasNeg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+    bool hasPos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+    
+    if (hasNeg && hasPos) {
+        return false;
+    }
+    
+    float totalArea = d1 + d2 + d3;
+    if (abs(totalArea) < 0.0001) {
+        return false;
+    }
+    
+    barycentric.x = d2 / totalArea;
+    barycentric.y = d3 / totalArea;
+    barycentric.z = d1 / totalArea;
+    
+    return true;
+}
+
+uint encodeDepth(float depth) {
+    float normalizedDepth = (depth + 1.0) * 0.5;
+    normalizedDepth = clamp(normalizedDepth, 0.0, 1.0);
+    return uint(normalizedDepth * 4294967295.0);
+}
+
+void main() {
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    
+    if (pixelCoords.x >= screenSize.x || pixelCoords.y >= screenSize.y) {
+        return;
+    }
+    
+    ivec2 tileCoords = pixelCoords / TILE_SIZE;
+    uint tileIndex = tileCoords.y * numTiles.x + tileCoords.x;
+    
+    uint tileStart = tileOffsets[tileIndex];
+    uint tileEnd = tileOffsets[tileIndex + 1];
+    uint numTrianglesInTile = tileEnd - tileStart;
+    
+    imageStore(outputImage, pixelCoords, vec4(0.0, 0.0, 0.0, 1.0));
+
+    if (numTrianglesInTile == 0) {
+        return;
+    }
+
+    vec2 pixelCenter = vec2(pixelCoords) + vec2(0.5);
+    
+    for (uint i = 0; i < numTrianglesInTile; i++) {
+        uint triangleID = triangleList[tileStart + i];
+        ProjectedTriangle tri = projectedTriangles[triangleID];
+        
+        vec3 barycentric;
+        if (!pointInTriangle(pixelCenter, tri.v0, tri.v1, tri.v2, barycentric)) {
+            continue;
+        }
+        
+        float interpolatedDepth = barycentric.x * tri.depth0 + 
+                                 barycentric.y * tri.depth1 + 
+                                 barycentric.z * tri.depth2;
+        
+        uint depthUInt = encodeDepth(interpolatedDepth);
+        
+        uint oldDepth = imageAtomicMin(depthBuffer, pixelCoords, depthUInt);
+        
+        if (depthUInt <= oldDepth) {
+            Face face = faces[tri.originalFaceIndex];
+            imageStore(outputImage, pixelCoords, vec4(face.color, 1.0));
+        }
+    }
+}

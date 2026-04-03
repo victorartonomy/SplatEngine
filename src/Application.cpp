@@ -1,0 +1,527 @@
+#include "Application.h"
+
+#include <imgui.h>
+#include <imgui_internal.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+#include <nfd.h>
+
+#include <iostream>
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
+
+// ============================================
+// CONSTRUCTION / DESTRUCTION
+// ============================================
+
+Application::Application() = default;
+Application::~Application() = default;
+
+// ============================================
+// INITIALIZE
+// ============================================
+
+bool Application::initialize() {
+    // ------------------------------------------
+    // 1. GLFW
+    // ------------------------------------------
+    if (!glfwInit()) {
+        std::cerr << "[ERROR] Failed to initialize GLFW" << std::endl;
+        return false;
+    }
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
+
+    m_window = glfwCreateWindow(m_windowWidth, m_windowHeight,
+                                "Triangle Splat Engine", nullptr, nullptr);
+    if (!m_window) {
+        std::cerr << "[ERROR] Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return false;
+    }
+    glfwMakeContextCurrent(m_window);
+    glfwSwapInterval(1);
+
+    // ------------------------------------------
+    // 2. GLAD
+    // ------------------------------------------
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cerr << "[ERROR] Failed to initialize GLAD" << std::endl;
+        glfwTerminate();
+        return false;
+    }
+    std::cout << "[INFO] OpenGL " << glGetString(GL_VERSION)
+              << " | " << glGetString(GL_RENDERER) << std::endl;
+
+    // ------------------------------------------
+    // 3. DEAR IMGUI
+    // ------------------------------------------
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(m_window, true);
+    ImGui_ImplOpenGL3_Init("#version 430");
+
+    // ------------------------------------------
+    // 4. NATIVE FILE DIALOG
+    // ------------------------------------------
+    if (NFD_Init() != NFD_OKAY) {
+        std::cerr << "[WARNING] NFD init failed — file dialogs disabled" << std::endl;
+    }
+
+    // ------------------------------------------
+    // 5. RENDERER (shaders, GPU resources, tile rasterizer)
+    // ------------------------------------------
+    if (!m_renderer.initialize(256, 256)) {
+        glfwTerminate();
+        return false;
+    }
+
+    // ------------------------------------------
+    // 8. TRY LOADING DEFAULT MESH
+    // ------------------------------------------
+    int assetIdx = m_scene.loadMeshAsset("models/room.off");
+    if (assetIdx >= 0) {
+        Entity& e    = m_scene.createEntity("room");
+        e.meshAssetIndex = assetIdx;
+        m_scene.recalculateSceneBounds();
+        m_camera.setPosition(m_scene.getSceneCenter() +
+            glm::vec3(0.0f, m_scene.getSceneSize().y * 0.5f, m_scene.getSceneSize().z * 2.0f));
+        m_camera.lookAt(m_scene.getSceneCenter());
+        m_renderer.submitScene(m_scene);
+    } else {
+        std::cout << "[INFO] No default mesh found — use Asset Manager to import" << std::endl;
+    }
+
+    // ------------------------------------------
+    // 9. EDITOR STATE
+    // ------------------------------------------
+    m_lastFPSTime = glfwGetTime();
+
+    std::cout << "[INFO] Editor ready — hold Right-Click in Viewport for camera control" << std::endl;
+    return true;
+}
+
+// ============================================
+// RUN
+// ============================================
+
+void Application::run() {
+    while (!glfwWindowShouldClose(m_window)) {
+        update();
+    }
+}
+
+// ============================================
+// UPDATE (one frame)
+// ============================================
+
+void Application::update() {
+    // --- Timing ---
+    float currentFrame = static_cast<float>(glfwGetTime());
+    m_deltaTime = currentFrame - m_lastFrame;
+    m_lastFrame = currentFrame;
+
+    m_frameCount++;
+    if (currentFrame - m_lastFPSTime >= 1.0) {
+        m_currentFPS = static_cast<float>(m_frameCount);
+        m_frameCount = 0;
+        m_lastFPSTime = currentFrame;
+    }
+
+    glfwPollEvents();
+
+    if (glfwGetKey(m_window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(m_window, true);
+
+    // --- ImGui frame ---
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    ImGuiIO& io = ImGui::GetIO();
+
+    // --- Build initial dock layout once ---
+    ImGuiID dockspaceId = ImGui::DockSpaceOverViewport();
+    if (m_firstLoop) {
+        m_firstLoop = false;
+        ImGui::DockBuilderRemoveNode(dockspaceId);
+        ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
+        ImVec2 vpSize;
+        vpSize.x = static_cast<float>(m_windowWidth);
+        vpSize.y = static_cast<float>(m_windowHeight);
+        ImGui::DockBuilderSetNodeSize(dockspaceId, vpSize);
+
+        ImGuiID dockLeft = 0, dockRight = 0, dockRightTop = 0, dockRightBottom = 0;
+        ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.75f, &dockLeft, &dockRight);
+        ImGui::DockBuilderSplitNode(dockRight, ImGuiDir_Up, 0.5f, &dockRightTop, &dockRightBottom);
+
+        ImGui::DockBuilderDockWindow("###Viewport",       dockLeft);
+        ImGui::DockBuilderDockWindow("Scene Hierarchy",   dockRightTop);
+        ImGui::DockBuilderDockWindow("Asset Manager",     dockRightTop);
+        ImGui::DockBuilderDockWindow("Camera Settings",   dockRightBottom);
+        ImGui::DockBuilderDockWindow("Mouse",             dockRightBottom);
+        ImGui::DockBuilderFinish(dockspaceId);
+    }
+
+    // =============================================
+    // VIEWPORT WINDOW
+    // =============================================
+    char vpTitle[64];
+    snprintf(vpTitle, sizeof(vpTitle), "Viewport  (%.0f FPS)###Viewport", m_currentFPS);
+    ImGui::Begin(vpTitle);
+    {
+        // --- Resize detection ---
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        int newW = std::max(16, static_cast<int>(avail.x));
+        int newH = std::max(16, static_cast<int>(avail.y));
+
+        if (newW != m_renderer.getViewportWidth() || newH != m_renderer.getViewportHeight())
+            m_renderer.resize(newW, newH);
+
+        // --- Camera input (RMB + hover) ---
+        bool vpHovered = ImGui::IsWindowHovered();
+        bool rmbDown   = ImGui::IsMouseDown(ImGuiMouseButton_Right);
+        bool lmbDown   = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        bool altDown   = io.KeyAlt;
+
+        if (vpHovered && rmbDown) {
+            if (ImGui::IsKeyDown(ImGuiKey_W))
+                m_camera.processKeyboard(CameraMovement::FORWARD, m_deltaTime);
+            if (ImGui::IsKeyDown(ImGuiKey_S))
+                m_camera.processKeyboard(CameraMovement::BACKWARD, m_deltaTime);
+            if (ImGui::IsKeyDown(ImGuiKey_A))
+                m_camera.processKeyboard(CameraMovement::LEFT, m_deltaTime);
+            if (ImGui::IsKeyDown(ImGuiKey_D))
+                m_camera.processKeyboard(CameraMovement::RIGHT, m_deltaTime);
+            if (ImGui::IsKeyDown(ImGuiKey_Space))
+                m_camera.processKeyboard(CameraMovement::UP, m_deltaTime);
+            if (ImGui::IsKeyDown(ImGuiKey_LeftShift))
+                m_camera.processKeyboard(CameraMovement::DOWN, m_deltaTime);
+
+            ImVec2 delta = io.MouseDelta;
+            if (delta.x != 0.0f || delta.y != 0.0f)
+                m_camera.processMouseMovement(delta.x, -delta.y);
+        }
+
+        // --- Camera rotate (Alt+LMB) ---
+        if (vpHovered && lmbDown && altDown) {
+            ImVec2 delta = io.MouseDelta;
+            if (delta.x != 0.0f || delta.y != 0.0f)
+                m_camera.processMouseMovement(delta.x, -delta.y);
+        }
+
+        if (vpHovered && io.MouseWheel != 0.0f)
+            m_camera.processMouseScroll(io.MouseWheel);
+
+        // --- Orbit (MMB drag) ---
+        bool mmbDown = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+        if (vpHovered && mmbDown) {
+            ImVec2 delta = io.MouseDelta;
+            if (delta.x != 0.0f || delta.y != 0.0f) {
+                glm::vec3 pivot = m_scene.hasVisibleMeshes()
+                                      ? m_scene.getSceneCenter()
+                                      : glm::vec3(0.0f);
+                m_camera.processOrbit(delta.x, -delta.y, pivot);
+            }
+        }
+
+        // --- Display compute output (flip V for OpenGL origin) ---
+        ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(m_renderer.getOutputTexture())),
+                     ImVec2(static_cast<float>(m_renderer.getViewportWidth()),
+                            static_cast<float>(m_renderer.getViewportHeight())),
+                     ImVec2(0, 1), ImVec2(1, 0));
+    }
+    ImGui::End();
+
+    // =============================================
+    // CAMERA SETTINGS WINDOW
+    // =============================================
+    ImGui::Begin("Camera Settings");
+    {
+        glm::vec3 pos = m_camera.getPosition();
+        if (ImGui::DragFloat3("Position", &pos.x, 1.0f))
+            m_camera.setPosition(pos);
+
+        float yaw = m_camera.getYaw();
+        if (ImGui::SliderFloat("Yaw", &yaw, -180.0f, 180.0f))
+            m_camera.setYaw(yaw);
+
+        float pitch = m_camera.getPitch();
+        if (ImGui::SliderFloat("Pitch", &pitch, -180.0f, 180.0f))
+            m_camera.setPitch(pitch);
+
+        float fov = m_camera.getFOV();
+        if (ImGui::SliderFloat("FOV", &fov, 1.0f, 90.0f))
+            m_camera.setFOV(fov);
+
+        float speed = m_camera.getMovementSpeed();
+        if (ImGui::DragFloat("Speed", &speed, 1.0f, 1.0f, 1000.0f))
+            m_camera.setMovementSpeed(speed);
+
+        float sens = m_camera.getMouseSensitivity();
+        if (ImGui::DragFloat("Sensitivity", &sens, 0.01f, 0.01f, 1.0f))
+            m_camera.setMouseSensitivity(sens);
+
+        // --- Presets ---
+        ImGui::Separator();
+        ImGui::Text("Presets");
+
+        if (ImGui::Button("Top-Down View")) {
+            if (m_scene.hasVisibleMeshes()) {
+                m_camera.setPosition(glm::vec3(m_scene.getSceneCenter().x,
+                                               m_scene.getSceneMax().y + m_scene.getSceneSize().y,
+                                               m_scene.getSceneCenter().z));
+                m_camera.lookAt(m_scene.getSceneCenter());
+            } else {
+                m_camera.setPosition(glm::vec3(0.0f, 500.0f, 0.0f));
+                m_camera.setPitch(-89.0f);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset to Origin")) {
+            m_camera.setPosition(glm::vec3(0.0f, 0.0f, 100.0f));
+            m_camera.setYaw(-90.0f);
+            m_camera.setPitch(0.0f);
+            m_camera.setFOV(45.0f);
+            m_camera.setMovementSpeed(50.0f);
+            m_camera.setMouseSensitivity(0.1f);
+        }
+
+        // --- Bookmarks ---
+        ImGui::Separator();
+        ImGui::Text("Bookmarks");
+
+        if (ImGui::Button("Save Current State")) {
+            CameraState s;
+            s.name             = "Bookmark " + std::to_string(m_bookmarks.size() + 1);
+            s.position         = m_camera.getPosition();
+            s.orientation      = m_camera.getOrientation();
+            s.yaw              = m_camera.getYaw();
+            s.pitch            = m_camera.getPitch();
+            s.fov              = m_camera.getFOV();
+            s.movementSpeed    = m_camera.getMovementSpeed();
+            s.mouseSensitivity = m_camera.getMouseSensitivity();
+            m_bookmarks.push_back(s);
+        }
+
+        for (int i = 0; i < static_cast<int>(m_bookmarks.size()); i++) {
+            ImGui::PushID(i);
+            if (ImGui::Button("Load")) {
+                const auto& b = m_bookmarks[i];
+                m_camera.setPosition(b.position);
+                m_camera.setOrientation(b.orientation);
+                m_camera.setFOV(b.fov);
+                m_camera.setMovementSpeed(b.movementSpeed);
+                m_camera.setMouseSensitivity(b.mouseSensitivity);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("X")) {
+                m_bookmarks.erase(m_bookmarks.begin() + i);
+                ImGui::PopID();
+                break;
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(m_bookmarks[i].name.c_str());
+            ImGui::PopID();
+        }
+    }
+    ImGui::End();
+
+    // =============================================
+    // SCENE HIERARCHY WINDOW
+    // =============================================
+    ImGui::Begin("Scene Hierarchy");
+    {
+        auto& entities = m_scene.getEntities();
+
+        // Clamp selection in case an entity was deleted
+        if (m_selectedEntity >= static_cast<int>(entities.size()))
+            m_selectedEntity = -1;
+
+        // --- Entity list ---
+        ImGui::Text("Entities (%zu)", entities.size());
+        ImGui::Separator();
+        for (int i = 0; i < static_cast<int>(entities.size()); i++) {
+            ImGui::PushID(i);
+            bool selected = (m_selectedEntity == i);
+            char label[128];
+            snprintf(label, sizeof(label), "%s%s",
+                     entities[i].name.c_str(),
+                     entities[i].visible ? "" : " [hidden]");
+            if (ImGui::Selectable(label, selected))
+                m_selectedEntity = i;
+            ImGui::PopID();
+        }
+
+        // --- Selected entity inspector ---
+        if (m_selectedEntity >= 0 && m_selectedEntity < static_cast<int>(entities.size())) {
+            ImGui::Separator();
+            Entity& ent = entities[m_selectedEntity];
+
+            // Name
+            char nameBuf[256];
+            strncpy_s(nameBuf, sizeof(nameBuf), ent.name.c_str(), _TRUNCATE);
+            if (ImGui::InputText("Name", nameBuf, sizeof(nameBuf)))
+                ent.name = nameBuf;
+
+            // Transform
+            bool changed = false;
+            changed |= ImGui::DragFloat3("Position", &ent.transform.position.x, 1.0f);
+            changed |= ImGui::DragFloat3("Rotation", &ent.transform.rotation.x, 1.0f);
+            changed |= ImGui::DragFloat3("Scale",    &ent.transform.scale.x, 0.01f, 0.001f, 100.0f);
+            changed |= ImGui::Checkbox("Visible", &ent.visible);
+
+            if (changed) {
+                m_renderer.submitScene(m_scene);
+                m_scene.recalculateSceneBounds();
+            }
+
+            // Mesh info
+            const MeshAsset* asset = m_scene.getMeshAsset(ent.meshAssetIndex);
+            if (asset) {
+                ImGui::Text("Mesh: %s", std::filesystem::path(asset->filePath).filename().string().c_str());
+                ImGui::Text("%zu verts, %zu faces",
+                            asset->mesh.getVertexCount(), asset->mesh.getFaceCount());
+            }
+
+            ImGui::Separator();
+
+            // Duplicate
+            if (ImGui::Button("Duplicate")) {
+                Entity clone      = ent;  // copy all fields
+                clone.name        = ent.name + " (copy)";
+                clone.transform.position += glm::vec3(50.0f, 0.0f, 0.0f);
+                Entity& newEnt    = m_scene.createEntity(clone.name);
+                newEnt.meshAssetIndex = clone.meshAssetIndex;
+                newEnt.transform  = clone.transform;
+                newEnt.visible    = clone.visible;
+                m_renderer.submitScene(m_scene);
+                m_scene.recalculateSceneBounds();
+            }
+            ImGui::SameLine();
+
+            // Delete
+            if (ImGui::Button("Delete")) {
+                uint32_t idToRemove = ent.id;
+                m_scene.removeEntity(idToRemove);
+                m_selectedEntity = -1;
+                m_renderer.submitScene(m_scene);
+                m_scene.recalculateSceneBounds();
+            }
+        }
+    }
+    ImGui::End();
+
+    // =============================================
+    // ASSET MANAGER WINDOW
+    // =============================================
+    ImGui::Begin("Asset Manager");
+    {
+        // --- Loaded mesh assets ---
+        auto& assets   = m_scene.getMeshAssets();
+        auto& entities = m_scene.getEntities();
+
+        if (!assets.empty()) {
+            ImGui::Text("Mesh Assets (%zu)", assets.size());
+            ImGui::Separator();
+            for (int i = 0; i < static_cast<int>(assets.size()); i++) {
+                // Count entities referencing this asset
+                int refCount = 0;
+                for (const auto& e : entities)
+                    if (e.meshAssetIndex == i) refCount++;
+
+                ImGui::Text("%s", std::filesystem::path(assets[i].filePath).filename().string().c_str());
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%zu v, %zu f, %d ref)",
+                                    assets[i].mesh.getVertexCount(),
+                                    assets[i].mesh.getFaceCount(),
+                                    refCount);
+            }
+            ImGui::Separator();
+        } else {
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), "No meshes loaded");
+            ImGui::Separator();
+        }
+
+        // --- Import ---
+        if (ImGui::Button("Import .off File")) {
+            nfdu8char_t* outPath = nullptr;
+            nfdu8filteritem_t filters[1] = { { "OFF Files", "off" } };
+            nfdresult_t result = NFD_OpenDialogU8(&outPath, filters, 1, nullptr);
+
+            if (result == NFD_OKAY) {
+                std::string newPath(outPath);
+                NFD_FreePathU8(outPath);
+
+                int idx = m_scene.loadMeshAsset(newPath);
+                if (idx >= 0) {
+                    std::string entityName =
+                        std::filesystem::path(newPath).stem().string();
+                    Entity& e        = m_scene.createEntity(entityName);
+                    e.meshAssetIndex = idx;
+                    m_scene.recalculateSceneBounds();
+                    m_camera.setPosition(m_scene.getSceneCenter() +
+                        glm::vec3(0.0f,
+                                  m_scene.getSceneSize().y * 0.5f,
+                                  m_scene.getSceneSize().z * 2.0f));
+                    m_camera.lookAt(m_scene.getSceneCenter());
+                    m_renderer.submitScene(m_scene);
+                }
+            } else if (result == NFD_ERROR) {
+                std::cerr << "[ERROR] NFD: " << NFD_GetError() << std::endl;
+            }
+        }
+
+        ImGui::SameLine();
+        bool dbg = m_renderer.getDebugMode();
+        if (ImGui::Checkbox("Debug Tiles", &dbg))
+            m_renderer.setDebugMode(dbg);
+    }
+    ImGui::End();
+
+    // =============================================
+    // RENDER (compute pipeline via Renderer)
+    // =============================================
+    m_renderer.render(m_scene, m_camera);
+
+    // =============================================
+    // RENDER IMGUI TO DEFAULT FRAMEBUFFER
+    // =============================================
+    ImGui::Render();
+    int fbW, fbH;
+    glfwGetFramebufferSize(m_window, &fbW, &fbH);
+    glViewport(0, 0, fbW, fbH);
+    glClearColor(0.06f, 0.06f, 0.06f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    glfwSwapBuffers(m_window);
+}
+
+// ============================================
+// SHUTDOWN
+// ============================================
+
+void Application::shutdown() {
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
+    // Release GPU resources before GL context is destroyed
+    m_renderer.shutdown();
+
+    NFD_Quit();
+
+    glfwDestroyWindow(m_window);
+    glfwTerminate();
+    std::cout << "[INFO] Engine shutdown complete" << std::endl;
+}

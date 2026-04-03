@@ -1,0 +1,52 @@
+# CMake
+build/
+cmake_out*.txt
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.slnx.sqlite
+*.db
+*.opendb
+*.VC.db
+*.pdb
+*.idb
+
+# Claude / AI Assistants
+.claude/
+.cursor/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Executables & Build outputs
+*.exe
+*.out
+*.app
+*.o
+*.obj
+*.lib
+*.dll
+*.a
+*.so
+*.dylib
+
+# Ignore ImGui ini file
+imgui.ini

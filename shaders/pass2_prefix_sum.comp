@@ -1,0 +1,160 @@
+#version 430 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer TileCounterBuffer {
+    uint tileCounters[];
+};
+
+layout(std430, binding = 1) buffer TileOffsetBuffer {
+    uint tileOffsets[];
+};
+
+layout(std430, binding = 2) buffer BlockSumBuffer {
+    uint blockSums[];
+};
+
+shared uint sharedData[256];
+
+uniform uint numElements;
+uniform uint pass;
+
+void main() {
+    uint globalID = gl_GlobalInvocationID.x;
+    uint localID = gl_LocalInvocationID.x;
+    uint groupID = gl_WorkGroupID.x;
+    uint groupSize = gl_WorkGroupSize.x;
+
+    if (pass == 0) {
+        if (globalID < numElements) {
+            sharedData[localID] = tileCounters[globalID];
+        } else {
+            sharedData[localID] = 0;
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        uint offset = 1;
+
+        for (uint d = groupSize >> 1; d > 0; d >>= 1) {
+            barrier();
+            memoryBarrierShared();
+
+            if (localID < d) {
+                uint ai = offset * (2 * localID + 1) - 1;
+                uint bi = offset * (2 * localID + 2) - 1;
+
+                if (bi < groupSize) {
+                    sharedData[bi] += sharedData[ai];
+                }
+            }
+
+            offset *= 2;
+        }
+
+        if (localID == 0) {
+            blockSums[groupID] = sharedData[groupSize - 1];
+            sharedData[groupSize - 1] = 0;
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        for (uint d = 1; d < groupSize; d *= 2) {
+            offset >>= 1;
+            barrier();
+            memoryBarrierShared();
+
+            if (localID < d) {
+                uint ai = offset * (2 * localID + 1) - 1;
+                uint bi = offset * (2 * localID + 2) - 1;
+
+                if (bi < groupSize) {
+                    uint temp = sharedData[ai];
+                    sharedData[ai] = sharedData[bi];
+                    sharedData[bi] += temp;
+                }
+            }
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        if (globalID < numElements) {
+            tileOffsets[globalID] = sharedData[localID];
+        }
+
+    } else if (pass == 1) {
+        // numElements holds the actual number of block sums to scan
+        if (localID < numElements) {
+            sharedData[localID] = blockSums[localID];
+        } else {
+            sharedData[localID] = 0;
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        uint offset = 1;
+
+        for (uint d = groupSize >> 1; d > 0; d >>= 1) {
+            barrier();
+            memoryBarrierShared();
+
+            if (localID < d) {
+                uint ai = offset * (2 * localID + 1) - 1;
+                uint bi = offset * (2 * localID + 2) - 1;
+
+                if (bi < groupSize) {
+                    sharedData[bi] += sharedData[ai];
+                }
+            }
+
+            offset *= 2;
+        }
+
+        if (localID == 0) {
+            sharedData[groupSize - 1] = 0;
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        for (uint d = 1; d < groupSize; d *= 2) {
+            offset >>= 1;
+            barrier();
+            memoryBarrierShared();
+
+            if (localID < d) {
+                uint ai = offset * (2 * localID + 1) - 1;
+                uint bi = offset * (2 * localID + 2) - 1;
+
+                if (bi < groupSize) {
+                    uint temp = sharedData[ai];
+                    sharedData[ai] = sharedData[bi];
+                    sharedData[bi] += temp;
+                }
+            }
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        if (localID < numElements) {
+            blockSums[localID] = sharedData[localID];
+        }
+
+    } else if (pass == 2) {
+        if (globalID < numElements && groupID > 0) {
+            tileOffsets[globalID] += blockSums[groupID];
+        }
+
+        barrier();
+        memoryBarrierBuffer();
+
+        if (localID == 0 && groupID == gl_NumWorkGroups.x - 1) {
+            tileOffsets[numElements] = tileOffsets[numElements - 1] + tileCounters[numElements - 1];
+        }
+    }
+}

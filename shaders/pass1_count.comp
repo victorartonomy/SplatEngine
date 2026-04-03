@@ -1,0 +1,155 @@
+#version 430 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const int TILE_SIZE = 16;
+
+struct Vertex {
+    vec3 position;
+    vec3 padding;
+};
+
+struct Face {
+    uvec3 indices;
+    vec3 color;
+    float padding;
+};
+
+struct ProjectedTriangle {
+    vec2 v0;
+    vec2 v1;
+    vec2 v2;
+    
+    float depth0;
+    float depth1;
+    float depth2;
+    
+    ivec2 aabbMin;
+    ivec2 aabbMax;
+    
+    uint originalFaceIndex;
+    uint padding[3];
+};
+
+layout(std430, binding = 0) buffer VertexBuffer {
+    Vertex vertices[];
+};
+
+layout(std430, binding = 1) buffer FaceBuffer {
+    Face faces[];
+};
+
+layout(std430, binding = 2) buffer ProjectedTriangleBuffer {
+    ProjectedTriangle projectedTriangles[];
+};
+
+layout(std430, binding = 3) buffer TileCounterBuffer {
+    uint tileCounters[];
+};
+
+uniform mat4 viewProjection;
+uniform ivec2 screenSize;
+uniform ivec2 numTiles;
+
+vec2 projectToScreen(vec3 worldPos, out float depth, out bool valid) {
+    vec4 clipSpace = viewProjection * vec4(worldPos, 1.0);
+
+    if (clipSpace.w <= 0.0001) {
+        valid = false;
+        depth = 1e10;
+        return vec2(0.0);
+    }
+
+    vec3 ndc = clipSpace.xyz / clipSpace.w;
+
+    depth = ndc.z;
+
+    valid = true;
+
+    vec2 screenPos;
+    screenPos.x = (ndc.x * 0.5 + 0.5) * screenSize.x;
+    screenPos.y = (ndc.y * 0.5 + 0.5) * screenSize.y;
+
+    return screenPos;
+}
+
+ivec2 calculateAABB(vec2 v0, vec2 v1, vec2 v2, out ivec2 aabbMin, out ivec2 aabbMax) {
+    vec2 minF = min(min(v0, v1), v2);
+    vec2 maxF = max(max(v0, v1), v2);
+    
+    aabbMin = ivec2(floor(minF));
+    aabbMax = ivec2(ceil(maxF));
+    
+    aabbMin = clamp(aabbMin, ivec2(0), screenSize - ivec2(1));
+    aabbMax = clamp(aabbMax, ivec2(0), screenSize - ivec2(1));
+    
+    return aabbMax - aabbMin;
+}
+
+void main() {
+    uint triangleID = gl_GlobalInvocationID.x;
+    uint faceCount = faces.length();
+    
+    if (triangleID >= faceCount) {
+        return;
+    }
+    
+    Face face = faces[triangleID];
+    
+    vec3 v0World = vertices[face.indices.x].position;
+    vec3 v1World = vertices[face.indices.y].position;
+    vec3 v2World = vertices[face.indices.z].position;
+    
+    bool valid0, valid1, valid2;
+    float depth0, depth1, depth2;
+    
+    vec2 v0Screen = projectToScreen(v0World, depth0, valid0);
+    vec2 v1Screen = projectToScreen(v1World, depth1, valid1);
+    vec2 v2Screen = projectToScreen(v2World, depth2, valid2);
+    
+    if (!valid0 || !valid1 || !valid2) {
+        projectedTriangles[triangleID].aabbMin = ivec2(-1);
+        projectedTriangles[triangleID].aabbMax = ivec2(-1);
+        return;
+    }
+    
+    ivec2 aabbMin, aabbMax;
+    ivec2 aabbSize = calculateAABB(v0Screen, v1Screen, v2Screen, aabbMin, aabbMax);
+    
+    if (aabbSize.x <= 0 || aabbSize.y <= 0) {
+        projectedTriangles[triangleID].aabbMin = ivec2(-1);
+        projectedTriangles[triangleID].aabbMax = ivec2(-1);
+        return;
+    }
+    
+    projectedTriangles[triangleID].v0 = v0Screen;
+    projectedTriangles[triangleID].v1 = v1Screen;
+    projectedTriangles[triangleID].v2 = v2Screen;
+    projectedTriangles[triangleID].depth0 = depth0;
+    projectedTriangles[triangleID].depth1 = depth1;
+    projectedTriangles[triangleID].depth2 = depth2;
+    projectedTriangles[triangleID].aabbMin = aabbMin;
+    projectedTriangles[triangleID].aabbMax = aabbMax;
+    projectedTriangles[triangleID].originalFaceIndex = triangleID;
+    
+    ivec2 tileMin = aabbMin / TILE_SIZE;
+    ivec2 tileMax = aabbMax / TILE_SIZE;
+
+    tileMin = clamp(tileMin, ivec2(0), numTiles - ivec2(1));
+    tileMax = clamp(tileMax, ivec2(0), numTiles - ivec2(1));
+
+    // Limit per-triangle tile coverage to prevent TDR timeout
+    ivec2 tileRange = tileMax - tileMin + ivec2(1);
+    if (tileRange.x * tileRange.y > 1024) {
+        projectedTriangles[triangleID].aabbMin = ivec2(-1);
+        projectedTriangles[triangleID].aabbMax = ivec2(-1);
+        return;
+    }
+
+    for (int ty = tileMin.y; ty <= tileMax.y; ty++) {
+        for (int tx = tileMin.x; tx <= tileMax.x; tx++) {
+            uint tileIndex = ty * numTiles.x + tx;
+            atomicAdd(tileCounters[tileIndex], 1);
+        }
+    }
+}
