@@ -4,8 +4,14 @@ A real-time rendering engine built on **Triangle Splatting** — a differentiabl
 
 > **Status:** Research Prototype
 
-![Screenshot Placeholder](docs/screenshot_placeholder.png)
-*Screenshots coming soon.*
+<img width="1920" height="1032" alt="Screenshot 2026-03-17 132846" src="https://github.com/user-attachments/assets/07c887ed-c635-454c-a784-9f74a6314881" />
+<img width="1920" height="1032" alt="Screenshot 2026-03-17 132911" src="https://github.com/user-attachments/assets/469cfb58-74bb-47d6-a6c2-5eb42b0505c9" />
+<img width="1115" height="628" alt="Screenshot 2026-03-17 133859" src="https://github.com/user-attachments/assets/6a5decd6-c78c-43c8-b43a-a20e022352e6" />
+<img width="1920" height="1032" alt="Screenshot 2026-03-17 133834" src="https://github.com/user-attachments/assets/08ec9e98-7771-47a9-bb39-454116ffc174" />
+<img width="1115" height="628" alt="Screenshot 2026-03-17 133740" src="https://github.com/user-attachments/assets/e3d59e4d-cfe2-4dfc-b1ef-8f68731b1c56" />
+<img width="1920" height="1032" alt="Screenshot 2026-03-17 133520" src="https://github.com/user-attachments/assets/e886869f-aaa2-469b-a30e-e15ee3d3614d" />
+<img width="410" height="119" alt="Screenshot 2026-03-17 132935" src="https://github.com/user-attachments/assets/80b81cc1-b34d-4754-a9f4-39a3b9adfcd9" />
+<img width="722" height="275" alt="Screenshot 2026-03-17 132922" src="https://github.com/user-attachments/assets/90b137ef-b9ad-4c85-a352-aba067d3de1e" />
 
 ---
 
