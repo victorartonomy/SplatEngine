@@ -7,6 +7,7 @@
 #include "Camera.h"
 #include "ComputeShader.h"
 #include "GPUBuffer.h"
+#include "LightManager.h"
 #include "Mesh.h"
 #include "Scene.h"
 #include "TileRasterizer.h"
@@ -44,6 +45,8 @@ public:
     void setDebugMode(bool enabled) { m_debugMode = enabled; }
     bool getDebugMode()       const { return m_debugMode;    }
 
+    LightManager& getLightManager() { return m_lightManager; }
+
 private:
     GLuint createOutputTexture(int width, int height);
     GLuint createDepthBuffer(int width, int height);
@@ -69,6 +72,8 @@ private:
     // Merged scene geometry (CPU-transformed, uploaded once per submitScene call)
     Mesh      m_mergedMesh;
     GPUBuffer m_mergedGpuBuffer;
+
+    LightManager m_lightManager;
 
     bool m_sceneDirty = true;   // safety net: auto-submit on first render if missed
     bool m_debugMode  = false;

@@ -3,7 +3,9 @@
 
 #include <string>
 #include <cstdint>
+#include <optional>
 #include "AssetHandle.h"
+#include "Light.h"
 #include "Transform.h"
 
 struct Entity {
@@ -12,6 +14,7 @@ struct Entity {
     Transform   transform;
     AssetHandle meshAsset;       // handle into AssetManager, default invalid (id=0)
     bool        visible = true;
+    std::optional<Light> light;  // present = this entity is a light
 };
 
 #endif // ENTITY_H

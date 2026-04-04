@@ -7,7 +7,7 @@
 struct Vertex {
     glm::vec3 position;
     float _pad0;           // std430: vec3 has 16-byte alignment
-    glm::vec3 padding;
+    glm::vec3 normal;
     float _pad1;           // struct size must be multiple of 16
 };
 

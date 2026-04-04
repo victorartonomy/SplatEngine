@@ -7,7 +7,7 @@ layout(r32ui, binding = 1) uniform uimage2D depthBuffer;
 
 struct Vertex {
     vec3 position;
-    vec3 padding;
+    vec3 normal;
 };
 
 struct Face {

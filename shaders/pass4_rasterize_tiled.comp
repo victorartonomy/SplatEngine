@@ -4,13 +4,14 @@
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 const int TILE_SIZE = 16;
+const float PI = 3.14159265359;
 
 layout(rgba32f, binding = 0) uniform image2D outputImage;
 layout(r32ui, binding = 1) coherent uniform uimage2D depthBuffer;
 
 struct Vertex {
     vec3 position;
-    vec3 padding;
+    vec3 normal;
 };
 
 struct Face {
@@ -23,16 +24,24 @@ struct ProjectedTriangle {
     vec2 v0;
     vec2 v1;
     vec2 v2;
-    
+
     float depth0;
     float depth1;
     float depth2;
-    
+
     ivec2 aabbMin;
     ivec2 aabbMax;
-    
+
     uint originalFaceIndex;
     uint padding[3];
+};
+
+struct GPULight {
+    vec3  position;    float type;
+    vec3  direction;   float intensity;
+    vec3  color;       float range;
+    float innerCos;    float outerCos;
+    float _pad0;       float _pad1;
 };
 
 layout(std430, binding = 2) buffer VertexBuffer {
@@ -55,85 +64,217 @@ layout(std430, binding = 6) buffer TriangleListBuffer {
     uint triangleList[];
 };
 
+layout(std430, binding = 7) buffer LightBuffer {
+    GPULight lights[];
+};
+
 uniform ivec2 screenSize;
 uniform ivec2 numTiles;
+uniform int   numLights;
+uniform vec3  cameraPos;
+uniform int   shadingModel;  // 0 = Blinn-Phong, 1 = PBR
 
-float sign(vec2 p1, vec2 p2, vec2 p3) {
+// -----------------------------------------------
+// Utility
+// -----------------------------------------------
+
+float sign2D(vec2 p1, vec2 p2, vec2 p3) {
     return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
 }
 
 bool pointInTriangle(vec2 pt, vec2 v0, vec2 v1, vec2 v2, out vec3 barycentric) {
-    float d1 = sign(pt, v0, v1);
-    float d2 = sign(pt, v1, v2);
-    float d3 = sign(pt, v2, v0);
+    float d1 = sign2D(pt, v0, v1);
+    float d2 = sign2D(pt, v1, v2);
+    float d3 = sign2D(pt, v2, v0);
 
     bool hasNeg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
     bool hasPos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
-    
-    if (hasNeg && hasPos) {
-        return false;
-    }
-    
+
+    if (hasNeg && hasPos) return false;
+
     float totalArea = d1 + d2 + d3;
-    if (abs(totalArea) < 0.0001) {
-        return false;
-    }
-    
+    if (abs(totalArea) < 0.0001) return false;
+
     barycentric.x = d2 / totalArea;
     barycentric.y = d3 / totalArea;
     barycentric.z = d1 / totalArea;
-    
     return true;
 }
 
 uint encodeDepth(float depth) {
-    float normalizedDepth = (depth + 1.0) * 0.5;
-    normalizedDepth = clamp(normalizedDepth, 0.0, 1.0);
-    return uint(normalizedDepth * 4294967295.0);
+    float nd = clamp((depth + 1.0) * 0.5, 0.0, 1.0);
+    return uint(nd * 4294967295.0);
 }
+
+// -----------------------------------------------
+// PBR helpers
+// -----------------------------------------------
+
+float distributionGGX(vec3 N, vec3 H, float roughness) {
+    float a  = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * denom * denom);
+}
+
+float geometrySchlickGGX(float NdotV, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    return NdotV / (NdotV * (1.0 - k) + k);
+}
+
+float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+    return geometrySchlickGGX(max(dot(N, V), 0.0), roughness)
+         * geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// -----------------------------------------------
+// Light attenuation
+// -----------------------------------------------
+
+float computeAttenuation(GPULight light, vec3 worldPos, out vec3 L) {
+    int ltype = int(light.type + 0.5);
+
+    if (ltype == 0) {
+        // Directional
+        L = normalize(-light.direction);
+        return 1.0;
+    }
+
+    vec3 toLight = light.position - worldPos;
+    float dist = length(toLight);
+    L = toLight / max(dist, 0.0001);
+    float atten = 1.0 / (1.0 + (dist / max(light.range, 0.001)) * (dist / max(light.range, 0.001)));
+
+    if (ltype == 2) {
+        // Spot
+        float theta = dot(-L, normalize(light.direction));
+        float epsilon = light.innerCos - light.outerCos;
+        float spotFade = clamp((theta - light.outerCos) / max(epsilon, 0.0001), 0.0, 1.0);
+        atten *= spotFade;
+    }
+
+    return atten;
+}
+
+// -----------------------------------------------
+// Shading
+// -----------------------------------------------
+
+vec3 shadeBlinnPhong(vec3 albedo, vec3 N, vec3 V, vec3 worldPos) {
+    vec3 result = vec3(0.03) * albedo;  // ambient
+
+    for (int i = 0; i < numLights; i++) {
+        vec3 L;
+        float atten = computeAttenuation(lights[i], worldPos, L);
+        if (atten < 0.001) continue;
+
+        float NdotL = max(dot(N, L), 0.0);
+        vec3 H = normalize(L + V);
+        float spec = pow(max(dot(N, H), 0.0), 64.0);
+
+        result += lights[i].color * lights[i].intensity * atten
+                * (albedo * NdotL + vec3(0.3) * spec);
+    }
+    return result;
+}
+
+vec3 shadePBR(vec3 albedo, vec3 N, vec3 V, vec3 worldPos) {
+    float metallic  = 0.0;
+    float roughness = 0.5;
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+
+    vec3 result = vec3(0.03) * albedo;  // ambient
+
+    for (int i = 0; i < numLights; i++) {
+        vec3 L;
+        float atten = computeAttenuation(lights[i], worldPos, L);
+        if (atten < 0.001) continue;
+
+        float NdotL = max(dot(N, L), 0.0);
+        if (NdotL <= 0.0) continue;
+
+        vec3 H = normalize(V + L);
+        float D = distributionGGX(N, H, roughness);
+        float G = geometrySmith(N, V, L, roughness);
+        vec3  F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+
+        vec3 specular = (D * G * F)
+            / max(4.0 * max(dot(N, V), 0.001) * NdotL, 0.001);
+
+        vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+        vec3 radiance = lights[i].color * lights[i].intensity * atten;
+        result += (kD * albedo / PI + specular) * radiance * NdotL;
+    }
+    return result;
+}
+
+// -----------------------------------------------
+// Main
+// -----------------------------------------------
 
 void main() {
     ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
-    
-    if (pixelCoords.x >= screenSize.x || pixelCoords.y >= screenSize.y) {
+
+    if (pixelCoords.x >= screenSize.x || pixelCoords.y >= screenSize.y)
         return;
-    }
-    
+
     ivec2 tileCoords = pixelCoords / TILE_SIZE;
     uint tileIndex = tileCoords.y * numTiles.x + tileCoords.x;
-    
+
     uint tileStart = tileOffsets[tileIndex];
     uint tileEnd = tileOffsets[tileIndex + 1];
     uint numTrianglesInTile = tileEnd - tileStart;
-    
+
     imageStore(outputImage, pixelCoords, vec4(0.0, 0.0, 0.0, 1.0));
 
-    if (numTrianglesInTile == 0) {
+    if (numTrianglesInTile == 0)
         return;
-    }
 
     vec2 pixelCenter = vec2(pixelCoords) + vec2(0.5);
-    
+
     for (uint i = 0; i < numTrianglesInTile; i++) {
         uint triangleID = triangleList[tileStart + i];
         ProjectedTriangle tri = projectedTriangles[triangleID];
-        
+
         vec3 barycentric;
-        if (!pointInTriangle(pixelCenter, tri.v0, tri.v1, tri.v2, barycentric)) {
+        if (!pointInTriangle(pixelCenter, tri.v0, tri.v1, tri.v2, barycentric))
             continue;
-        }
-        
-        float interpolatedDepth = barycentric.x * tri.depth0 + 
-                                 barycentric.y * tri.depth1 + 
+
+        float interpolatedDepth = barycentric.x * tri.depth0 +
+                                 barycentric.y * tri.depth1 +
                                  barycentric.z * tri.depth2;
-        
+
         uint depthUInt = encodeDepth(interpolatedDepth);
-        
         uint oldDepth = imageAtomicMin(depthBuffer, pixelCoords, depthUInt);
-        
+
         if (depthUInt <= oldDepth) {
             Face face = faces[tri.originalFaceIndex];
-            imageStore(outputImage, pixelCoords, vec4(face.color, 1.0));
+            uvec3 idx = face.indices;
+
+            // Interpolate normal and world position
+            vec3 N = normalize(barycentric.x * vertices[idx.x].normal
+                             + barycentric.y * vertices[idx.y].normal
+                             + barycentric.z * vertices[idx.z].normal);
+            vec3 worldPos = barycentric.x * vertices[idx.x].position
+                          + barycentric.y * vertices[idx.y].position
+                          + barycentric.z * vertices[idx.z].position;
+
+            vec3 V = normalize(cameraPos - worldPos);
+            vec3 albedo = face.color;
+
+            vec3 color;
+            if (shadingModel == 1)
+                color = shadePBR(albedo, N, V, worldPos);
+            else
+                color = shadeBlinnPhong(albedo, N, V, worldPos);
+
+            imageStore(outputImage, pixelCoords, vec4(color, 1.0));
         }
     }
 }

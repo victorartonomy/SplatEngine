@@ -45,6 +45,28 @@ bool COFFParser::loadFromFile(const std::string& filePath, Mesh& outMesh) {
 
     file.close();
 
+    // Compute smooth per-vertex normals
+    for (auto& v : outMesh.vertices)
+        v.normal = glm::vec3(0.0f);
+
+    for (const auto& f : outMesh.faces) {
+        const glm::vec3& v0 = outMesh.vertices[f.indices.x].position;
+        const glm::vec3& v1 = outMesh.vertices[f.indices.y].position;
+        const glm::vec3& v2 = outMesh.vertices[f.indices.z].position;
+        glm::vec3 faceNormal = glm::cross(v1 - v0, v2 - v0);
+        float len = glm::length(faceNormal);
+        if (len > 1e-8f) faceNormal /= len;
+        outMesh.vertices[f.indices.x].normal += faceNormal;
+        outMesh.vertices[f.indices.y].normal += faceNormal;
+        outMesh.vertices[f.indices.z].normal += faceNormal;
+    }
+
+    for (auto& v : outMesh.vertices) {
+        float len = glm::length(v.normal);
+        if (len > 1e-8f) v.normal /= len;
+        else             v.normal = glm::vec3(0.0f, 1.0f, 0.0f);
+    }
+
     auto endTime = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
     
@@ -97,7 +119,7 @@ bool COFFParser::parseVertices(std::ifstream& file, size_t vertexCount, std::vec
         }
 
         vertex._pad0 = 0.0f;
-        vertex.padding = glm::vec3(0.0f);
+        vertex.normal = glm::vec3(0.0f);
         vertex._pad1 = 0.0f;
         vertices.push_back(vertex);
 

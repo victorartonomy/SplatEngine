@@ -6,7 +6,7 @@ const int TILE_SIZE = 16;
 
 struct Vertex {
     vec3 position;
-    vec3 padding;
+    vec3 normal;
 };
 
 struct Face {

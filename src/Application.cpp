@@ -187,6 +187,7 @@ void Application::update() {
         ImGui::DockBuilderDockWindow("Scene Hierarchy",   dockRightTop);
         ImGui::DockBuilderDockWindow("Asset Manager",     dockRightTop);
         ImGui::DockBuilderDockWindow("Camera Settings",   dockRightBottom);
+        ImGui::DockBuilderDockWindow("Lighting",          dockRightBottom);
         ImGui::DockBuilderDockWindow("Mouse",             dockRightBottom);
         ImGui::DockBuilderFinish(dockspaceId);
     }
@@ -442,6 +443,37 @@ void Application::update() {
                 m_renderer.submitScene(m_scene, m_assetManager);
                 m_scene.recalculateSceneBounds(m_assetManager);
             }
+
+            // --- Light component ---
+            ImGui::Separator();
+            if (ent.light.has_value()) {
+                ImGui::Text("Light Component");
+                Light& light = *ent.light;
+
+                const char* typeNames[] = { "Directional", "Point", "Spot" };
+                int typeIdx = static_cast<int>(light.type);
+                if (ImGui::Combo("Light Type", &typeIdx, typeNames, 3))
+                    light.type = static_cast<LightType>(typeIdx);
+
+                ImGui::ColorEdit3("Light Color", &light.color.x);
+                ImGui::DragFloat("Intensity", &light.intensity, 0.1f, 0.0f, 100.0f);
+
+                if (light.type == LightType::Point || light.type == LightType::Spot)
+                    ImGui::DragFloat("Range", &light.range, 1.0f, 1.0f, 10000.0f);
+
+                if (light.type == LightType::Spot) {
+                    ImGui::DragFloat("Inner Cone", &light.innerCone, 0.5f, 1.0f, 89.0f);
+                    ImGui::DragFloat("Outer Cone", &light.outerCone, 0.5f, 1.0f, 90.0f);
+                    if (light.outerCone < light.innerCone)
+                        light.outerCone = light.innerCone + 1.0f;
+                }
+
+                if (ImGui::Button("Remove Light"))
+                    ent.light.reset();
+            } else {
+                if (ImGui::Button("Add Light"))
+                    ent.light = Light{};
+            }
         }
     }
     ImGui::End();
@@ -510,6 +542,58 @@ void Application::update() {
         bool dbg = m_renderer.getDebugMode();
         if (ImGui::Checkbox("Debug Tiles", &dbg))
             m_renderer.setDebugMode(dbg);
+    }
+    ImGui::End();
+
+    // =============================================
+    // LIGHTING WINDOW
+    // =============================================
+    ImGui::Begin("Lighting");
+    {
+        const char* modelNames[] = { "Blinn-Phong", "PBR (Metallic-Roughness)" };
+        int modelIdx = static_cast<int>(m_renderer.getLightManager().getShadingModel());
+        if (ImGui::Combo("Shading Model", &modelIdx, modelNames, 2))
+            m_renderer.getLightManager().setShadingModel(static_cast<ShadingModel>(modelIdx));
+
+        ImGui::Separator();
+
+        if (ImGui::Button("Add Directional Light")) {
+            Entity& e = m_scene.createEntity("Directional Light");
+            e.light = Light{LightType::Directional};
+            e.transform.rotation = glm::vec3(-45.0f, 30.0f, 0.0f);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add Point Light")) {
+            Entity& e = m_scene.createEntity("Point Light");
+            e.light = Light{LightType::Point};
+            e.transform.position = m_scene.hasVisibleMeshes()
+                ? m_scene.getSceneCenter() + glm::vec3(0, m_scene.getSceneSize().y, 0)
+                : glm::vec3(0, 50, 0);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add Spot Light")) {
+            Entity& e = m_scene.createEntity("Spot Light");
+            e.light = Light{LightType::Spot};
+            e.transform.position = m_scene.hasVisibleMeshes()
+                ? m_scene.getSceneCenter() + glm::vec3(0, m_scene.getSceneSize().y, 0)
+                : glm::vec3(0, 50, 0);
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Scene Lights:");
+        auto& entities = m_scene.getEntities();
+        for (int i = 0; i < static_cast<int>(entities.size()); i++) {
+            if (!entities[i].light.has_value()) continue;
+            ImGui::PushID(i + 10000);
+            const char* typeLabel =
+                entities[i].light->type == LightType::Directional ? "[Dir]" :
+                entities[i].light->type == LightType::Point       ? "[Pt]"  : "[Sp]";
+            char label[128];
+            snprintf(label, sizeof(label), "%s %s", typeLabel, entities[i].name.c_str());
+            if (ImGui::Selectable(label, m_selectedEntity == i))
+                m_selectedEntity = i;
+            ImGui::PopID();
+        }
     }
     ImGui::End();
 

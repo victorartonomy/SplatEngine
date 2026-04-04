@@ -78,6 +78,7 @@ void Renderer::shutdown() {
     glDeleteTextures(1, &m_outputTexture); m_outputTexture = 0;
     glDeleteTextures(1, &m_depthBuffer);   m_depthBuffer   = 0;
 
+    m_lightManager.shutdown();
     m_tileRasterizer.reset();
     m_clearDepthShader.reset();
     m_clearTilesShader.reset();
@@ -122,9 +123,11 @@ void Renderer::submitScene(Scene& scene, const AssetManager& am) {
         size_t vertexOffset = m_mergedMesh.vertices.size();
         glm::mat4 model = entity.transform.getModelMatrix();
 
+        glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(model)));
         for (const Vertex& v : asset->mesh.vertices) {
             Vertex transformed   = v;
             transformed.position = glm::vec3(model * glm::vec4(v.position, 1.0f));
+            transformed.normal   = glm::normalize(normalMatrix * v.normal);
             m_mergedMesh.vertices.push_back(transformed);
         }
 
@@ -268,6 +271,8 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
                                      glm::ivec2(m_viewportWidth, m_viewportHeight));
         m_debugTilesShader->dispatch(numGroupsX, numGroupsY, 1);
     } else if (totalPairs > 0) {
+        m_lightManager.update(scene.getEntities());
+
         m_pass4Shader->use();
         glBindImageTexture(0, m_outputTexture, 0, GL_FALSE, 0,
                            GL_WRITE_ONLY, GL_RGBA32F);
@@ -281,12 +286,17 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
                          m_tileRasterizer->getTileOffsetBufferID());
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6,
                          m_tileRasterizer->getTriangleListBufferID());
+        m_lightManager.bind(7);
 
         m_pass4Shader->setIVec2("screenSize",
                                 glm::ivec2(m_viewportWidth, m_viewportHeight));
         m_pass4Shader->setIVec2("numTiles",
                                 glm::ivec2(m_tileRasterizer->getNumTilesX(),
                                            m_tileRasterizer->getNumTilesY()));
+        m_pass4Shader->setInt("numLights", m_lightManager.getLightCount());
+        m_pass4Shader->setVec3("cameraPos", camera.getPosition());
+        m_pass4Shader->setInt("shadingModel",
+                              static_cast<int>(m_lightManager.getShadingModel()));
         m_pass4Shader->dispatch(numGroupsX, numGroupsY, 1);
     } else {
         // No visible geometry — fill with dark background
