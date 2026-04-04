@@ -1,4 +1,6 @@
 #include "Application.h"
+#include "EventBus.h"
+#include "Events.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -104,7 +106,24 @@ bool Application::initialize() {
     }
 
     // ------------------------------------------
-    // 9. EDITOR STATE
+    // 9. EVENT SUBSCRIPTIONS
+    // ------------------------------------------
+    bus().subscribe<WindowResizeEvent>([this](const WindowResizeEvent& e) {
+        m_renderer.resize(e.width, e.height);
+    });
+
+    bus().subscribe<AssetLoadedEvent>([](const AssetLoadedEvent& e) {
+        std::cout << "[EVENT] Asset loaded: " << e.path
+                  << " (handle " << e.handle.id << ")" << std::endl;
+    });
+
+    bus().subscribe<ActionEvent>([this](const ActionEvent& e) {
+        if (e.action == Action::Quit && e.pressed)
+            glfwSetWindowShouldClose(m_window, true);
+    });
+
+    // ------------------------------------------
+    // 10. EDITOR STATE
     // ------------------------------------------
     m_lastFPSTime = glfwGetTime();
 
@@ -149,9 +168,6 @@ void Application::update() {
     ImGuiIO& io = ImGui::GetIO();
     m_inputManager.update(io, m_viewportWasHovered);
 
-    if (m_inputManager.isActionDown(Action::Quit))
-        glfwSetWindowShouldClose(m_window, true);
-
     // --- Build initial dock layout once ---
     ImGuiID dockspaceId = ImGui::DockSpaceOverViewport();
     if (m_firstLoop) {
@@ -188,7 +204,7 @@ void Application::update() {
         int newH = std::max(16, static_cast<int>(avail.y));
 
         if (newW != m_renderer.getViewportWidth() || newH != m_renderer.getViewportHeight())
-            m_renderer.resize(newW, newH);
+            bus().publish(WindowResizeEvent{newW, newH});
 
         // --- Camera input ---
         if (m_inputManager.isRMBDown() && m_inputManager.isViewportHovered()) {

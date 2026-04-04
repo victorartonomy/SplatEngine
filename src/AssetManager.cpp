@@ -1,5 +1,7 @@
 #include "AssetManager.h"
 #include "COFFParser.h"
+#include "EventBus.h"
+#include "Events.h"
 
 #include <iostream>
 #include <chrono>
@@ -72,7 +74,9 @@ AssetHandle AssetManager::load(const std::string& filePath) {
     entry->refCount = 1;
 
     AssetHandle handle{m_nextId++};
+    std::string path = entry->asset.filePath;
     m_entries[handle.id] = std::move(entry);
+    bus().publish(AssetLoadedEvent{handle, path});
     return handle;
 }
 
@@ -170,6 +174,7 @@ void AssetManager::update() {
             }
             uploadToGPU(entry->asset);
             entry->gpuReady = true;
+            bus().publish(AssetLoadedEvent{AssetHandle{id}, entry->asset.filePath});
         }
     }
 

@@ -93,6 +93,7 @@ add_executable(Engine
     src/Renderer.cpp
     src/AssetManager.cpp
     src/InputManager.cpp
+    src/EventBus.cpp
 )
 
 # Include directories for the Engine

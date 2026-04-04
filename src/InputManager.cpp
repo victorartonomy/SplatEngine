@@ -1,4 +1,6 @@
 #include "InputManager.h"
+#include "EventBus.h"
+#include "Events.h"
 
 #include <imgui.h>
 #include <GLFW/glfw3.h>
@@ -16,6 +18,8 @@ void InputManager::initialize(GLFWwindow* window) {
 }
 
 void InputManager::update(const ImGuiIO& io, bool viewportHovered) {
+    m_prevActionState = m_actionState;
+
     for (size_t i = 0; i < static_cast<size_t>(Action::Count); ++i) {
         Action action = static_cast<Action>(i);
         auto it = m_actionBindings.find(action);
@@ -23,6 +27,9 @@ void InputManager::update(const ImGuiIO& io, bool viewportHovered) {
             m_actionState[i] = (glfwGetKey(m_window, it->second) == GLFW_PRESS);
         else
             m_actionState[i] = false;
+
+        if (m_actionState[i] != m_prevActionState[i])
+            bus().publish(ActionEvent{action, m_actionState[i]});
     }
 
     m_rmbDown = io.MouseDown[1];

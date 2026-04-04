@@ -44,6 +44,7 @@ private:
     std::unordered_map<Action, int> m_actionBindings;
 
     std::array<bool,  static_cast<size_t>(Action::Count)> m_actionState{};
+    std::array<bool,  static_cast<size_t>(Action::Count)> m_prevActionState{};
     std::array<float, static_cast<size_t>(Axis::Count)>   m_axisValues{};
 
     bool m_viewportHovered = false;
