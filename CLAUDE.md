@@ -30,7 +30,7 @@ There are no tests or linting configured.
 
 This is a **Triangle Splatting** renderer -- a compute-shader-only rendering engine. There is NO traditional vertex/fragment graphics pipeline for geometry. All projection, binning, rasterization, and depth testing run as compute shader dispatches. The screen is divided into 16x16 pixel tiles for efficient per-pixel work.
 
-### Rendering Pipeline (orchestrated in main.cpp)
+### Rendering Pipeline (orchestrated in `Application.cpp`)
 
 | Phase | Shader | Purpose |
 |-------|--------|---------|
@@ -43,12 +43,13 @@ This is a **Triangle Splatting** renderer -- a compute-shader-only rendering eng
 
 ### Key Components
 
+- **Application** (`Application.h/cpp`) -- Render loop, ImGui editor UI, asset manager, scene management, camera controls
+- **InputManager** (`InputManager.h/cpp`) -- Named action/axis polling, rebindable GLFW key mappings; `Action` and `Axis` enums defined here
 - **Camera** (`Camera.h/cpp`, `CameraState.h`) -- FPS 6DOF camera with quaternion orientation, orbit mode, bookmarks
 - **COFFParser** (`COFFParser.h/cpp`) -- Loads OFF/COFF mesh files with optional per-face RGB colors
 - **GPUBuffer** (`GPUBuffer.h/cpp`) -- Manages Vertex (binding 0) and Face (binding 1) SSBOs
 - **TileRasterizer** (`TileRasterizer.h/cpp`, `TileData.h`) -- Allocates and manages 6 SSBOs for the tiling pipeline, handles prefix sum CPU readback
 - **ComputeShader** (`ComputeShader.h/cpp`) -- Loads/compiles .comp files, dispatches with memory barriers
-- **main.cpp** (~680 lines) -- Render loop, ImGui editor UI, asset manager, camera controls
 
 ## Critical Constraints
 
@@ -61,14 +62,15 @@ This is a **Triangle Splatting** renderer -- a compute-shader-only rendering eng
 ## Adding a New Shader
 
 1. Add `.comp` file to `shaders/`
-2. Instantiate `ComputeShader` in `main.cpp`
+2. Instantiate `ComputeShader` in `Application.cpp`
 3. Dispatch in the appropriate phase of the render loop
 4. Shaders auto-copy to build dir on rebuild
 
 ## Where to Edit
 
 - Camera behavior: `Camera.cpp`
+- Key bindings / input actions: `InputManager.cpp` (`initialize()`)
 - Rasterization logic (blending, shading): `pass4_rasterize_tiled.comp`
-- UI/editor features: search for `ImGui::Begin` in `main.cpp`
+- UI/editor features: search for `ImGui::Begin` in `Application.cpp`
 - Mesh loading: `COFFParser.cpp`
 - Tile size tuning: `TILE_SIZE` in `TileData.h` (must also update shader workgroup sizes)
