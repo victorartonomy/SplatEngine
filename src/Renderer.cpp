@@ -1,4 +1,5 @@
 #include "Renderer.h"
+#include "AssetManager.h"
 
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/glm.hpp>
@@ -107,14 +108,14 @@ void Renderer::resize(int newWidth, int newHeight) {
 // SUBMIT SCENE
 // ============================================
 
-void Renderer::submitScene(Scene& scene) {
+void Renderer::submitScene(Scene& scene, const AssetManager& am) {
     m_mergedMesh.vertices.clear();
     m_mergedMesh.faces.clear();
 
     for (const Entity& entity : scene.getEntities()) {
-        if (!entity.visible || entity.meshAssetIndex < 0)
+        if (!entity.visible || !entity.meshAsset.isValid())
             continue;
-        const MeshAsset* asset = scene.getMeshAsset(entity.meshAssetIndex);
+        const MeshAsset* asset = am.get(entity.meshAsset);
         if (!asset)
             continue;
 
@@ -147,9 +148,9 @@ void Renderer::submitScene(Scene& scene) {
 // RENDER
 // ============================================
 
-void Renderer::render(Scene& scene, const Camera& camera) {
+void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am) {
     if (m_sceneDirty)
-        submitScene(scene);
+        submitScene(scene, am);
 
     if (!scene.hasVisibleMeshes() ||
         m_mergedMesh.getFaceCount() == 0 ||

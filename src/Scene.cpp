@@ -1,12 +1,11 @@
 #include "Scene.h"
-#include "COFFParser.h"
+#include "AssetManager.h"
 
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
-#include <iostream>
 
 // ============================================
 // Transform
@@ -26,42 +25,6 @@ glm::mat4 Transform::getModelMatrix() const {
 // Scene
 // ============================================
 
-int Scene::loadMeshAsset(const std::string& filePath) {
-    // Deduplication — return existing index if already loaded
-    for (int i = 0; i < static_cast<int>(m_meshAssets.size()); i++) {
-        if (m_meshAssets[i].filePath == filePath)
-            return i;
-    }
-
-    MeshAsset asset;
-    asset.filePath = filePath;
-
-    if (!COFFParser::loadFromFile(filePath, asset.mesh) ||
-        asset.mesh.getVertexCount() == 0 || asset.mesh.getFaceCount() == 0) {
-        std::cerr << "[ERROR] Scene: failed to load mesh: " << filePath << std::endl;
-        return -1;
-    }
-
-    asset.gpuBuffer.uploadMesh(asset.mesh);
-
-    // Compute object-space bounds
-    asset.boundsMin = glm::vec3(1e10f);
-    asset.boundsMax = glm::vec3(-1e10f);
-    for (const auto& v : asset.mesh.vertices) {
-        asset.boundsMin = glm::min(asset.boundsMin, v.position);
-        asset.boundsMax = glm::max(asset.boundsMax, v.position);
-    }
-    asset.boundsCenter = (asset.boundsMin + asset.boundsMax) * 0.5f;
-    asset.boundsSize   = asset.boundsMax - asset.boundsMin;
-
-    std::cout << "[INFO] Scene: loaded mesh asset \"" << filePath << "\" ("
-              << asset.mesh.getVertexCount() << " verts, "
-              << asset.mesh.getFaceCount()   << " faces)" << std::endl;
-
-    m_meshAssets.push_back(std::move(asset));
-    return static_cast<int>(m_meshAssets.size()) - 1;
-}
-
 Entity& Scene::createEntity(const std::string& name) {
     Entity e;
     e.id   = m_nextEntityId++;
@@ -77,29 +40,23 @@ void Scene::removeEntity(uint32_t id) {
         m_entities.end());
 }
 
-const MeshAsset* Scene::getMeshAsset(int index) const {
-    if (index < 0 || index >= static_cast<int>(m_meshAssets.size()))
-        return nullptr;
-    return &m_meshAssets[index];
-}
-
 bool Scene::hasVisibleMeshes() const {
     for (const auto& e : m_entities) {
-        if (e.visible && e.meshAssetIndex >= 0)
+        if (e.visible && e.meshAsset.isValid())
             return true;
     }
     return false;
 }
 
-void Scene::recalculateSceneBounds() {
+void Scene::recalculateSceneBounds(const AssetManager& am) {
     glm::vec3 sceneMin( 1e10f);
     glm::vec3 sceneMax(-1e10f);
     bool anyVisible = false;
 
     for (const auto& entity : m_entities) {
-        if (!entity.visible || entity.meshAssetIndex < 0)
+        if (!entity.visible || !entity.meshAsset.isValid())
             continue;
-        const MeshAsset* asset = getMeshAsset(entity.meshAssetIndex);
+        const MeshAsset* asset = am.get(entity.meshAsset);
         if (!asset)
             continue;
 

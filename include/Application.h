@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "AssetManager.h"
 #include "Camera.h"
 #include "CameraState.h"
 #include "Renderer.h"
@@ -36,6 +37,9 @@ private:
 
     // Renderer (owns the compute pipeline, GPU resources, merged mesh)
     Renderer m_renderer;
+
+    // Asset management
+    AssetManager m_assetManager;
 
     // Scene
     Camera m_camera{glm::vec3(0.0f, 0.0f, 100.0f)};

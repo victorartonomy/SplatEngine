@@ -88,15 +88,15 @@ bool Application::initialize() {
     // ------------------------------------------
     // 8. TRY LOADING DEFAULT MESH
     // ------------------------------------------
-    int assetIdx = m_scene.loadMeshAsset("models/room.off");
-    if (assetIdx >= 0) {
-        Entity& e    = m_scene.createEntity("room");
-        e.meshAssetIndex = assetIdx;
-        m_scene.recalculateSceneBounds();
+    AssetHandle roomHandle = m_assetManager.load("models/room.off");
+    if (roomHandle.isValid()) {
+        Entity& e   = m_scene.createEntity("room");
+        e.meshAsset = roomHandle;
+        m_scene.recalculateSceneBounds(m_assetManager);
         m_camera.setPosition(m_scene.getSceneCenter() +
             glm::vec3(0.0f, m_scene.getSceneSize().y * 0.5f, m_scene.getSceneSize().z * 2.0f));
         m_camera.lookAt(m_scene.getSceneCenter());
-        m_renderer.submitScene(m_scene);
+        m_renderer.submitScene(m_scene, m_assetManager);
     } else {
         std::cout << "[INFO] No default mesh found — use Asset Manager to import" << std::endl;
     }
@@ -381,12 +381,12 @@ void Application::update() {
             changed |= ImGui::Checkbox("Visible", &ent.visible);
 
             if (changed) {
-                m_renderer.submitScene(m_scene);
-                m_scene.recalculateSceneBounds();
+                m_renderer.submitScene(m_scene, m_assetManager);
+                m_scene.recalculateSceneBounds(m_assetManager);
             }
 
             // Mesh info
-            const MeshAsset* asset = m_scene.getMeshAsset(ent.meshAssetIndex);
+            const MeshAsset* asset = m_assetManager.get(ent.meshAsset);
             if (asset) {
                 ImGui::Text("Mesh: %s", std::filesystem::path(asset->filePath).filename().string().c_str());
                 ImGui::Text("%zu verts, %zu faces",
@@ -401,21 +401,26 @@ void Application::update() {
                 clone.name        = ent.name + " (copy)";
                 clone.transform.position += glm::vec3(50.0f, 0.0f, 0.0f);
                 Entity& newEnt    = m_scene.createEntity(clone.name);
-                newEnt.meshAssetIndex = clone.meshAssetIndex;
+                newEnt.meshAsset  = clone.meshAsset;
                 newEnt.transform  = clone.transform;
                 newEnt.visible    = clone.visible;
-                m_renderer.submitScene(m_scene);
-                m_scene.recalculateSceneBounds();
+                if (newEnt.meshAsset.isValid())
+                    m_assetManager.addRef(newEnt.meshAsset);
+                m_renderer.submitScene(m_scene, m_assetManager);
+                m_scene.recalculateSceneBounds(m_assetManager);
             }
             ImGui::SameLine();
 
             // Delete
             if (ImGui::Button("Delete")) {
+                AssetHandle handleToRelease = ent.meshAsset;
                 uint32_t idToRemove = ent.id;
                 m_scene.removeEntity(idToRemove);
                 m_selectedEntity = -1;
-                m_renderer.submitScene(m_scene);
-                m_scene.recalculateSceneBounds();
+                if (handleToRelease.isValid())
+                    m_assetManager.release(handleToRelease);
+                m_renderer.submitScene(m_scene, m_assetManager);
+                m_scene.recalculateSceneBounds(m_assetManager);
             }
         }
     }
@@ -427,24 +432,24 @@ void Application::update() {
     ImGui::Begin("Asset Manager");
     {
         // --- Loaded mesh assets ---
-        auto& assets   = m_scene.getMeshAssets();
-        auto& entities = m_scene.getEntities();
+        auto assetInfos = m_assetManager.getAssetInfos();
 
-        if (!assets.empty()) {
-            ImGui::Text("Mesh Assets (%zu)", assets.size());
+        if (!assetInfos.empty()) {
+            ImGui::Text("Mesh Assets (%zu)", assetInfos.size());
             ImGui::Separator();
-            for (int i = 0; i < static_cast<int>(assets.size()); i++) {
+            for (const auto& info : assetInfos) {
                 // Count entities referencing this asset
                 int refCount = 0;
-                for (const auto& e : entities)
-                    if (e.meshAssetIndex == i) refCount++;
+                for (const auto& e : m_scene.getEntities())
+                    if (e.meshAsset == info.handle) refCount++;
 
-                ImGui::Text("%s", std::filesystem::path(assets[i].filePath).filename().string().c_str());
+                ImGui::Text("%s", std::filesystem::path(info.filePath).filename().string().c_str());
                 ImGui::SameLine();
-                ImGui::TextDisabled("(%zu v, %zu f, %d ref)",
-                                    assets[i].mesh.getVertexCount(),
-                                    assets[i].mesh.getFaceCount(),
-                                    refCount);
+                ImGui::TextDisabled("(%zu v, %zu f, %d ref%s)",
+                                    info.vertexCount,
+                                    info.faceCount,
+                                    refCount,
+                                    info.ready ? "" : " [loading]");
             }
             ImGui::Separator();
         } else {
@@ -462,19 +467,19 @@ void Application::update() {
                 std::string newPath(outPath);
                 NFD_FreePathU8(outPath);
 
-                int idx = m_scene.loadMeshAsset(newPath);
-                if (idx >= 0) {
+                AssetHandle handle = m_assetManager.load(newPath);
+                if (handle.isValid()) {
                     std::string entityName =
                         std::filesystem::path(newPath).stem().string();
-                    Entity& e        = m_scene.createEntity(entityName);
-                    e.meshAssetIndex = idx;
-                    m_scene.recalculateSceneBounds();
+                    Entity& e    = m_scene.createEntity(entityName);
+                    e.meshAsset  = handle;
+                    m_scene.recalculateSceneBounds(m_assetManager);
                     m_camera.setPosition(m_scene.getSceneCenter() +
                         glm::vec3(0.0f,
                                   m_scene.getSceneSize().y * 0.5f,
                                   m_scene.getSceneSize().z * 2.0f));
                     m_camera.lookAt(m_scene.getSceneCenter());
-                    m_renderer.submitScene(m_scene);
+                    m_renderer.submitScene(m_scene, m_assetManager);
                 }
             } else if (result == NFD_ERROR) {
                 std::cerr << "[ERROR] NFD: " << NFD_GetError() << std::endl;
@@ -491,7 +496,8 @@ void Application::update() {
     // =============================================
     // RENDER (compute pipeline via Renderer)
     // =============================================
-    m_renderer.render(m_scene, m_camera);
+    m_assetManager.update();
+    m_renderer.render(m_scene, m_camera, m_assetManager);
 
     // =============================================
     // RENDER IMGUI TO DEFAULT FRAMEBUFFER
@@ -518,6 +524,7 @@ void Application::shutdown() {
 
     // Release GPU resources before GL context is destroyed
     m_renderer.shutdown();
+    m_assetManager.shutdown();
 
     NFD_Quit();
 

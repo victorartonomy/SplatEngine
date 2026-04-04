@@ -11,6 +11,8 @@
 #include "Scene.h"
 #include "TileRasterizer.h"
 
+class AssetManager;
+
 class Renderer {
 public:
     Renderer()  = default;
@@ -27,10 +29,10 @@ public:
 
     // Rebuild the merged GPU buffers from the current scene state.
     // Call whenever the scene is mutated (entity added/removed, transform changed).
-    void submitScene(Scene& scene);
+    void submitScene(Scene& scene, const AssetManager& am);
 
     // Execute the full 5-phase compute pipeline, writing to the internal output texture.
-    void render(Scene& scene, const Camera& camera);
+    void render(Scene& scene, const Camera& camera, const AssetManager& am);
 
     // Recreate viewport-sized render targets when the panel is resized.
     void resize(int newWidth, int newHeight);

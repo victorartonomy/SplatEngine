@@ -91,6 +91,7 @@ add_executable(Engine
     src/Camera.cpp
     src/TileRasterizer.cpp
     src/Renderer.cpp
+    src/AssetManager.cpp
 )
 
 # Include directories for the Engine
