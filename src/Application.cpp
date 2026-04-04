@@ -48,6 +48,8 @@ bool Application::initialize() {
     glfwMakeContextCurrent(m_window);
     glfwSwapInterval(1);
 
+    m_inputManager.initialize(m_window);
+
     // ------------------------------------------
     // 2. GLAD
     // ------------------------------------------
@@ -139,15 +141,16 @@ void Application::update() {
 
     glfwPollEvents();
 
-    if (glfwGetKey(m_window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-        glfwSetWindowShouldClose(m_window, true);
-
     // --- ImGui frame ---
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
     ImGuiIO& io = ImGui::GetIO();
+    m_inputManager.update(io, m_viewportWasHovered);
+
+    if (m_inputManager.isActionDown(Action::Quit))
+        glfwSetWindowShouldClose(m_window, true);
 
     // --- Build initial dock layout once ---
     ImGuiID dockspaceId = ImGui::DockSpaceOverViewport();
@@ -187,50 +190,49 @@ void Application::update() {
         if (newW != m_renderer.getViewportWidth() || newH != m_renderer.getViewportHeight())
             m_renderer.resize(newW, newH);
 
-        // --- Camera input (RMB + hover) ---
-        bool vpHovered = ImGui::IsWindowHovered();
-        bool rmbDown   = ImGui::IsMouseDown(ImGuiMouseButton_Right);
-        bool lmbDown   = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-        bool altDown   = io.KeyAlt;
-
-        if (vpHovered && rmbDown) {
-            if (ImGui::IsKeyDown(ImGuiKey_W))
+        // --- Camera input ---
+        if (m_inputManager.isRMBDown() && m_inputManager.isViewportHovered()) {
+            if (m_inputManager.isActionDown(Action::CameraFwd))
                 m_camera.processKeyboard(CameraMovement::FORWARD, m_deltaTime);
-            if (ImGui::IsKeyDown(ImGuiKey_S))
+            if (m_inputManager.isActionDown(Action::CameraBack))
                 m_camera.processKeyboard(CameraMovement::BACKWARD, m_deltaTime);
-            if (ImGui::IsKeyDown(ImGuiKey_A))
+            if (m_inputManager.isActionDown(Action::CameraLeft))
                 m_camera.processKeyboard(CameraMovement::LEFT, m_deltaTime);
-            if (ImGui::IsKeyDown(ImGuiKey_D))
+            if (m_inputManager.isActionDown(Action::CameraRight))
                 m_camera.processKeyboard(CameraMovement::RIGHT, m_deltaTime);
-            if (ImGui::IsKeyDown(ImGuiKey_Space))
+            if (m_inputManager.isActionDown(Action::CameraUp))
                 m_camera.processKeyboard(CameraMovement::UP, m_deltaTime);
-            if (ImGui::IsKeyDown(ImGuiKey_LeftShift))
+            if (m_inputManager.isActionDown(Action::CameraDown))
                 m_camera.processKeyboard(CameraMovement::DOWN, m_deltaTime);
 
-            ImVec2 delta = io.MouseDelta;
-            if (delta.x != 0.0f || delta.y != 0.0f)
-                m_camera.processMouseMovement(delta.x, -delta.y);
+            float dx = m_inputManager.getAxis(Axis::MouseX);
+            float dy = m_inputManager.getAxis(Axis::MouseY);
+            if (dx != 0.0f || dy != 0.0f)
+                m_camera.processMouseMovement(dx, -dy);
         }
 
         // --- Camera rotate (Alt+LMB) ---
-        if (vpHovered && lmbDown && altDown) {
-            ImVec2 delta = io.MouseDelta;
-            if (delta.x != 0.0f || delta.y != 0.0f)
-                m_camera.processMouseMovement(delta.x, -delta.y);
+        if (m_inputManager.isLMBDown() && m_inputManager.isAltDown()
+                && m_inputManager.isViewportHovered()) {
+            float dx = m_inputManager.getAxis(Axis::MouseX);
+            float dy = m_inputManager.getAxis(Axis::MouseY);
+            if (dx != 0.0f || dy != 0.0f)
+                m_camera.processMouseMovement(dx, -dy);
         }
 
-        if (vpHovered && io.MouseWheel != 0.0f)
-            m_camera.processMouseScroll(io.MouseWheel);
+        float scroll = m_inputManager.getAxis(Axis::MouseScrollY);
+        if (m_inputManager.isViewportHovered() && scroll != 0.0f)
+            m_camera.processMouseScroll(scroll);
 
         // --- Orbit (MMB drag) ---
-        bool mmbDown = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
-        if (vpHovered && mmbDown) {
-            ImVec2 delta = io.MouseDelta;
-            if (delta.x != 0.0f || delta.y != 0.0f) {
+        if (m_inputManager.isMMBDown() && m_inputManager.isViewportHovered()) {
+            float dx = m_inputManager.getAxis(Axis::MouseX);
+            float dy = m_inputManager.getAxis(Axis::MouseY);
+            if (dx != 0.0f || dy != 0.0f) {
                 glm::vec3 pivot = m_scene.hasVisibleMeshes()
                                       ? m_scene.getSceneCenter()
                                       : glm::vec3(0.0f);
-                m_camera.processOrbit(delta.x, -delta.y, pivot);
+                m_camera.processOrbit(dx, -dy, pivot);
             }
         }
 
@@ -239,6 +241,8 @@ void Application::update() {
                      ImVec2(static_cast<float>(m_renderer.getViewportWidth()),
                             static_cast<float>(m_renderer.getViewportHeight())),
                      ImVec2(0, 1), ImVec2(1, 0));
+
+        m_viewportWasHovered = ImGui::IsWindowHovered();
     }
     ImGui::End();
 

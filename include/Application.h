@@ -12,6 +12,7 @@
 #include "AssetManager.h"
 #include "Camera.h"
 #include "CameraState.h"
+#include "InputManager.h"
 #include "Renderer.h"
 #include "Scene.h"
 
@@ -45,6 +46,10 @@ private:
     Camera m_camera{glm::vec3(0.0f, 0.0f, 100.0f)};
     Scene  m_scene;
     int    m_selectedEntity = -1;   // index into m_scene.getEntities(), or -1
+
+    // Input
+    InputManager m_inputManager;
+    bool m_viewportWasHovered = false;
 
     // Editor state
     std::vector<CameraState> m_bookmarks;
