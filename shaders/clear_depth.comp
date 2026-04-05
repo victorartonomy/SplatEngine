@@ -1,14 +1,30 @@
 #version 430 core
 
+// clear_depth.comp — Phase 0a: Reset the depth buffer to maximum depth.
+//
+// Each invocation clears one pixel of the R32UI depth buffer.
+// 0xFFFFFFFF is chosen because it is the maximum uint32 value, which maps to
+// "farthest possible depth" after encodeDepth() in pass4 converts NDC depth
+// to a uint in [0, 0xFFFFFFFF]. imageAtomicMin in pass4 can then replace it
+// with any triangle's depth (which is always ≤ max).
+//
+// Workgroup: 16×16 threads to match the 16×16-pixel tile size. The CPU dispatches
+// ceil(width/16) × ceil(height/16) groups so every pixel is covered.
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+// Depth buffer: single-channel 32-bit unsigned integer image.
+// Bound at image unit 0 (GL_WRITE_ONLY) by Renderer::render() before this dispatch.
 layout(r32ui, binding = 0) uniform uimage2D depthBuffer;
 
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(depthBuffer);
-    
+
+    // Guard: discard threads that fall outside the actual image bounds
+    // (can happen for edge tiles when viewport dimensions are not multiples of 16)
     if (coords.x < size.x && coords.y < size.y) {
+        // 0xFFFFFFFF = 4294967295 = maximum uint32 = "infinitely far" depth sentinel
         imageStore(depthBuffer, coords, uvec4(0xFFFFFFFF));
     }
 }

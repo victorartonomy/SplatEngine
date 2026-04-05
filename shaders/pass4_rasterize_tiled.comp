@@ -1,29 +1,59 @@
 #version 430 core
 #extension GL_ARB_gpu_shader_int64 : require
 
+// pass4_rasterize_tiled.comp — Phase 3: Per-pixel rasterization, depth testing, and shading.
+//
+// Each workgroup processes one 16×16 pixel tile. Each invocation processes one pixel.
+// For the pixel, the shader:
+//   1. Determines which tile it belongs to and reads the tile's triangle list.
+//   2. For each triangle in the list, runs a point-in-triangle test.
+//   3. On pass: computes barycentric coordinates, interpolates depth, runs atomicMin depth test.
+//   4. On depth test pass: interpolates normal + world position, runs the selected shading model.
+//   5. Writes the shaded color to the output image.
+//
+// Depth encoding:
+//   NDC depth (in [-1,1]) is mapped to a uint32 in [0, 0xFFFFFFFF] by:
+//     nd = clamp((depth+1)*0.5, 0, 1)
+//     depthUInt = uint(nd * 4294967295)
+//   imageAtomicMin compares these uints. Smaller uint = closer (lower NDC Z = nearer).
+//   The clear pass initializes all pixels to 0xFFFFFFFF ("infinitely far").
+//
+// Shading models (selected by the `shadingModel` uniform):
+//   0 = Blinn-Phong: diffuse (NdotL) + specular (H = normalize(L+V), shininess 64)
+//   1 = PBR metallic-roughness: Cook-Torrance BRDF
+//         D = GGX normal distribution
+//         G = Smith geometry masking-shadowing
+//         F = Schlick Fresnel approximation
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-const int TILE_SIZE = 16;
+const int   TILE_SIZE = 16;
 const float PI = 3.14159265359;
 
+// Output color image (RGBA32F, write-only)
 layout(rgba32f, binding = 0) uniform image2D outputImage;
+// Depth buffer (R32UI, read-write for imageAtomicMin)
+// `coherent` ensures atomic writes from different invocations are visible to each other
 layout(r32ui, binding = 1) coherent uniform uimage2D depthBuffer;
 
+// Vertex: world-space position (after model matrix) and smooth normal (after normal matrix)
 struct Vertex {
     vec3 position;
     vec3 normal;
 };
 
+// Face: vertex indices into the merged vertex buffer + per-face color
 struct Face {
     uvec3 indices;
-    vec3 color;
+    vec3  color;
     float padding;
 };
 
+// ProjectedTriangle: pass1 output — screen-space positions, NDC depths, AABB
 struct ProjectedTriangle {
-    vec2 v0;
-    vec2 v1;
-    vec2 v2;
+    vec2  v0;
+    vec2  v1;
+    vec2  v2;
 
     float depth0;
     float depth1;
@@ -36,52 +66,55 @@ struct ProjectedTriangle {
     uint padding[3];
 };
 
+// GPULight: 64-byte std430 struct (see Light.h for byte-offset layout)
+// Each vec3 is followed by a float packing to satisfy std430 16-byte alignment.
 struct GPULight {
-    vec3  position;    float type;
+    vec3  position;    float type;       // type: 0=Directional, 1=Point, 2=Spot (stored as float)
     vec3  direction;   float intensity;
     vec3  color;       float range;
-    float innerCos;    float outerCos;
+    float innerCos;    float outerCos;   // Pre-computed cos(innerCone/outerCone) to avoid trig in shader
     float _pad0;       float _pad1;
 };
 
-layout(std430, binding = 2) buffer VertexBuffer {
-    Vertex vertices[];
-};
-
-layout(std430, binding = 3) buffer FaceBuffer {
-    Face faces[];
-};
-
-layout(std430, binding = 4) buffer ProjectedTriangleBuffer {
-    ProjectedTriangle projectedTriangles[];
-};
-
-layout(std430, binding = 5) buffer TileOffsetBuffer {
-    uint tileOffsets[];
-};
-
-layout(std430, binding = 6) buffer TriangleListBuffer {
-    uint triangleList[];
-};
-
-layout(std430, binding = 7) buffer LightBuffer {
-    GPULight lights[];
-};
+// SSBO binding layout (must match Renderer.cpp pass4 setup):
+//   binding 2: vertex SSBO
+//   binding 3: face SSBO
+//   binding 4: projected triangle buffer (pass1 output)
+//   binding 5: tile offset buffer (pass2 output — per-tile start in triangleList)
+//   binding 6: triangle list buffer (pass3 output — flat list of triangle IDs per tile)
+//   binding 7: light SSBO (LightManager output — GPULight array)
+layout(std430, binding = 2) buffer VertexBuffer            { Vertex vertices[]; };
+layout(std430, binding = 3) buffer FaceBuffer              { Face faces[]; };
+layout(std430, binding = 4) buffer ProjectedTriangleBuffer { ProjectedTriangle projectedTriangles[]; };
+layout(std430, binding = 5) buffer TileOffsetBuffer        { uint tileOffsets[]; };
+layout(std430, binding = 6) buffer TriangleListBuffer      { uint triangleList[]; };
+layout(std430, binding = 7) buffer LightBuffer             { GPULight lights[]; };
 
 uniform ivec2 screenSize;
 uniform ivec2 numTiles;
 uniform int   numLights;
 uniform vec3  cameraPos;
-uniform int   shadingModel;  // 0 = Blinn-Phong, 1 = PBR
+uniform int   shadingModel; // 0 = Blinn-Phong, 1 = PBR
 
 // -----------------------------------------------
 // Utility
 // -----------------------------------------------
 
+// 2D signed area function used for the point-in-triangle test.
+// Returns the signed area of the parallelogram spanned by (p2→p1) and (p2→p3).
+// Positive value = p1 is to the left of the directed edge p2→p3 (counter-clockwise winding).
 float sign2D(vec2 p1, vec2 p2, vec2 p3) {
     return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
 }
 
+// Point-in-triangle test using edge functions (sign2D for each edge).
+// If all three sign2D values have the same sign (all positive or all negative),
+// the point lies inside the triangle (handles both CW and CCW winding).
+// Returns true on pass; writes barycentric coordinates into `barycentric`:
+//   barycentric.x = weight for vertex 0
+//   barycentric.y = weight for vertex 1
+//   barycentric.z = weight for vertex 2
+// Used to interpolate depth, normals, and world position inside the triangle.
 bool pointInTriangle(vec2 pt, vec2 v0, vec2 v1, vec2 v2, out vec3 barycentric) {
     float d1 = sign2D(pt, v0, v1);
     float d2 = sign2D(pt, v1, v2);
@@ -90,45 +123,65 @@ bool pointInTriangle(vec2 pt, vec2 v0, vec2 v1, vec2 v2, out vec3 barycentric) {
     bool hasNeg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
     bool hasPos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
 
+    // Mixed signs → point is outside the triangle (on different sides of different edges)
     if (hasNeg && hasPos) return false;
 
+    // Degenerate triangle (zero or near-zero area) — skip to avoid division by near-zero
     float totalArea = d1 + d2 + d3;
     if (abs(totalArea) < 0.0001) return false;
 
-    barycentric.x = d2 / totalArea;
-    barycentric.y = d3 / totalArea;
-    barycentric.z = d1 / totalArea;
+    // Normalize edge function values by total area to get barycentric coordinates in [0,1]
+    barycentric.x = d2 / totalArea; // Weight for vertex 0 (opposite to edge v1→v2)
+    barycentric.y = d3 / totalArea; // Weight for vertex 1 (opposite to edge v2→v0)
+    barycentric.z = d1 / totalArea; // Weight for vertex 2 (opposite to edge v0→v1)
     return true;
 }
 
+// Encode NDC depth (in [-1,1]) to a uint32 for imageAtomicMin depth testing.
+// Maps [-1,1] → [0,1] → [0, 0xFFFFFFFF].
+// Smaller encoded value = closer to the camera.
+// The clear pass sets all pixels to 0xFFFFFFFF so any first write always wins.
 uint encodeDepth(float depth) {
     float nd = clamp((depth + 1.0) * 0.5, 0.0, 1.0);
     return uint(nd * 4294967295.0);
 }
 
 // -----------------------------------------------
-// PBR helpers
+// PBR helpers (Cook-Torrance BRDF components)
 // -----------------------------------------------
 
+// GGX (Trowbridge-Reitz) normal distribution function.
+// D(H) = α² / (π * ((NdotH)² * (α²-1) + 1)²)
+// Describes how microfacet normals are distributed around H (half-vector).
+// Higher roughness → broader highlight; lower roughness → sharper, mirror-like.
 float distributionGGX(vec3 N, vec3 H, float roughness) {
-    float a  = roughness * roughness;
-    float a2 = a * a;
+    float a   = roughness * roughness; // Perceptual roughness → α
+    float a2  = a * a;
     float NdotH = max(dot(N, H), 0.0);
     float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
     return a2 / (PI * denom * denom);
 }
 
+// Schlick-GGX geometry function for one direction (view or light).
+// Approximates the shadowing/masking of microfacets.
+// k = (roughness+1)² / 8 is the remapped roughness for direct lighting.
 float geometrySchlickGGX(float NdotV, float roughness) {
     float r = roughness + 1.0;
     float k = (r * r) / 8.0;
     return NdotV / (NdotV * (1.0 - k) + k);
 }
 
+// Smith's combined geometry function (view + light masking-shadowing).
+// G(N,V,L) = G_sub(N,V) * G_sub(N,L)
 float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
     return geometrySchlickGGX(max(dot(N, V), 0.0), roughness)
          * geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
 }
 
+// Schlick Fresnel approximation.
+// F(θ) = F0 + (1 - F0) * (1 - cosθ)^5
+// F0 is the specular reflectance at normal incidence (0° from normal).
+// For non-metals F0 ≈ (0.04, 0.04, 0.04); for metals F0 = albedo.
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
@@ -137,24 +190,38 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
 // Light attenuation
 // -----------------------------------------------
 
+// Compute the light direction L and attenuation factor for a given GPULight.
+// Writes L as the unit vector pointing *from the surface toward the light*.
+// Returns attenuation in [0,1]:
+//   Directional: attenuation = 1.0 (infinite-distance, no falloff)
+//   Point: inverse-square falloff scaled by range: 1 / (1 + (dist/range)²)
+//   Spot: point falloff × smooth cone fade using smoothstep on cosine angles
+//
+// The type is stored as a float (0.0, 1.0, 2.0) and rounded to an int to avoid
+// float comparison errors from GPU rounding.
 float computeAttenuation(GPULight light, vec3 worldPos, out vec3 L) {
-    int ltype = int(light.type + 0.5);
+    int ltype = int(light.type + 0.5); // Round float type to nearest int
 
     if (ltype == 0) {
-        // Directional
+        // Directional: L = opposite of light direction (direction points away from source)
         L = normalize(-light.direction);
-        return 1.0;
+        return 1.0; // No distance attenuation for infinite-distance directional lights
     }
 
     vec3 toLight = light.position - worldPos;
     float dist = length(toLight);
-    L = toLight / max(dist, 0.0001);
+    L = toLight / max(dist, 0.0001); // Normalize safely (avoid division by ~0)
+
+    // Physically-based inverse-square falloff, bounded by range to avoid infinite reach
     float atten = 1.0 / (1.0 + (dist / max(light.range, 0.001)) * (dist / max(light.range, 0.001)));
 
     if (ltype == 2) {
-        // Spot
+        // Spot: apply cone fade on top of point attenuation.
+        // theta = cosine of the angle between (-L) and the light's forward direction.
+        // smoothstep maps [outerCos, innerCos] → [0,1]: 0 at outer edge, 1 in full-intensity cone.
+        // Pre-computed innerCos/outerCos values avoid calling acos() here.
         float theta = dot(-L, normalize(light.direction));
-        float epsilon = light.innerCos - light.outerCos;
+        float epsilon = light.innerCos - light.outerCos; // Must be > 0 (inner < outer angle → inner > outer cosine)
         float spotFade = clamp((theta - light.outerCos) / max(epsilon, 0.0001), 0.0, 1.0);
         atten *= spotFade;
     }
@@ -163,33 +230,45 @@ float computeAttenuation(GPULight light, vec3 worldPos, out vec3 L) {
 }
 
 // -----------------------------------------------
-// Shading
+// Shading models
 // -----------------------------------------------
 
+// Blinn-Phong shading: fast approximation for diffuse + specular lighting.
+//   Diffuse:  lambertian (albedo * NdotL)
+//   Specular: Blinn's half-vector H = normalize(L+V), shininess exponent 64
+//   Ambient:  constant 3% of albedo to prevent fully unlit areas
 vec3 shadeBlinnPhong(vec3 albedo, vec3 N, vec3 V, vec3 worldPos) {
-    vec3 result = vec3(0.03) * albedo;  // ambient
+    vec3 result = vec3(0.03) * albedo; // Ambient term
 
     for (int i = 0; i < numLights; i++) {
         vec3 L;
         float atten = computeAttenuation(lights[i], worldPos, L);
-        if (atten < 0.001) continue;
+        if (atten < 0.001) continue; // Skip negligibly attenuated lights
 
         float NdotL = max(dot(N, L), 0.0);
-        vec3 H = normalize(L + V);
-        float spec = pow(max(dot(N, H), 0.0), 64.0);
+        vec3 H = normalize(L + V); // Blinn's half-vector: bisector of L and V
+        float spec = pow(max(dot(N, H), 0.0), 64.0); // Specular highlight (shininess = 64)
 
         result += lights[i].color * lights[i].intensity * atten
-                * (albedo * NdotL + vec3(0.3) * spec);
+                * (albedo * NdotL + vec3(0.3) * spec); // Diffuse + specular contribution
     }
     return result;
 }
 
+// PBR (Cook-Torrance) shading with metallic-roughness workflow.
+// Uses constant metallic=0, roughness=0.5 (dielectric surface, medium roughness).
+// F0: specular reflectance at normal incidence — 0.04 for dielectrics, albedo for metals.
+//
+// BRDF = (kD * albedo/π + specular) * radiance * NdotL
+//   where specular = (D * G * F) / (4 * NdotV * NdotL)
+//   kD = diffuse weight = (1 - F) * (1 - metallic)  [energy conservation]
 vec3 shadePBR(vec3 albedo, vec3 N, vec3 V, vec3 worldPos) {
     float metallic  = 0.0;
     float roughness = 0.5;
+    // F0: linear interpolation between dielectric (0.04) and metallic (albedo)
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
-    vec3 result = vec3(0.03) * albedo;  // ambient
+    vec3 result = vec3(0.03) * albedo; // Ambient term
 
     for (int i = 0; i < numLights; i++) {
         vec3 L;
@@ -197,17 +276,24 @@ vec3 shadePBR(vec3 albedo, vec3 N, vec3 V, vec3 worldPos) {
         if (atten < 0.001) continue;
 
         float NdotL = max(dot(N, L), 0.0);
-        if (NdotL <= 0.0) continue;
+        if (NdotL <= 0.0) continue; // Back-face to this light — no contribution
 
-        vec3 H = normalize(V + L);
-        float D = distributionGGX(N, H, roughness);
-        float G = geometrySmith(N, V, L, roughness);
-        vec3  F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+        vec3 H = normalize(V + L); // Half-vector for Cook-Torrance
 
+        // Cook-Torrance specular BRDF components
+        float D = distributionGGX(N, H, roughness);  // Microfacet distribution
+        float G = geometrySmith(N, V, L, roughness);  // Geometry masking-shadowing
+        vec3  F = fresnelSchlick(max(dot(H, V), 0.0), F0); // Fresnel reflectance
+
+        // Specular term: (D * G * F) / (4 * NdotV * NdotL)
+        // Clamp denominator to avoid divide-by-zero when view/light is near grazing
         vec3 specular = (D * G * F)
             / max(4.0 * max(dot(N, V), 0.001) * NdotL, 0.001);
 
+        // Diffuse weight: energy remaining after specular reflection
+        // kD = 0 for metals (all energy goes into specular)
         vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+
         vec3 radiance = lights[i].color * lights[i].intensity * atten;
         result += (kD * albedo / PI + specular) * radiance * NdotL;
     }
@@ -221,53 +307,69 @@ vec3 shadePBR(vec3 albedo, vec3 N, vec3 V, vec3 worldPos) {
 void main() {
     ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
 
+    // Guard: discard threads outside the viewport (edge tiles may extend beyond screen)
     if (pixelCoords.x >= screenSize.x || pixelCoords.y >= screenSize.y)
         return;
 
+    // Determine which tile this pixel belongs to and read its triangle range
     ivec2 tileCoords = pixelCoords / TILE_SIZE;
     uint tileIndex = tileCoords.y * numTiles.x + tileCoords.x;
 
+    // [tileStart, tileEnd) is the half-open range of this tile's entries in triangleList[]
     uint tileStart = tileOffsets[tileIndex];
-    uint tileEnd = tileOffsets[tileIndex + 1];
+    uint tileEnd   = tileOffsets[tileIndex + 1];
     uint numTrianglesInTile = tileEnd - tileStart;
 
+    // Initialize output pixel to black; skip entirely if this tile has no triangles
     imageStore(outputImage, pixelCoords, vec4(0.0, 0.0, 0.0, 1.0));
-
     if (numTrianglesInTile == 0)
         return;
 
+    // Test against the center of the pixel (not the corner) for correct sub-pixel coverage
     vec2 pixelCenter = vec2(pixelCoords) + vec2(0.5);
 
     for (uint i = 0; i < numTrianglesInTile; i++) {
         uint triangleID = triangleList[tileStart + i];
         ProjectedTriangle tri = projectedTriangles[triangleID];
 
+        // Point-in-triangle test with barycentric coordinate output
         vec3 barycentric;
         if (!pointInTriangle(pixelCenter, tri.v0, tri.v1, tri.v2, barycentric))
             continue;
 
+        // Barycentric interpolation of NDC depth for depth testing
         float interpolatedDepth = barycentric.x * tri.depth0 +
-                                 barycentric.y * tri.depth1 +
-                                 barycentric.z * tri.depth2;
+                                  barycentric.y * tri.depth1 +
+                                  barycentric.z * tri.depth2;
 
+        // Encode to uint and perform atomic depth test.
+        // imageAtomicMin returns the *old* depth value:
+        //   if depthUInt < oldDepth → this triangle is closer → write its color
+        //   if depthUInt >= oldDepth → another triangle already won → skip
         uint depthUInt = encodeDepth(interpolatedDepth);
-        uint oldDepth = imageAtomicMin(depthBuffer, pixelCoords, depthUInt);
+        uint oldDepth  = imageAtomicMin(depthBuffer, pixelCoords, depthUInt);
 
         if (depthUInt <= oldDepth) {
+            // This pixel is now owned by this triangle — shade it
             Face face = faces[tri.originalFaceIndex];
             uvec3 idx = face.indices;
 
-            // Interpolate normal and world position
+            // Interpolate per-vertex normal from the 3 triangle vertices
+            // Renormalize after interpolation since barycentric-weighted normals aren't unit-length
             vec3 N = normalize(barycentric.x * vertices[idx.x].normal
                              + barycentric.y * vertices[idx.y].normal
                              + barycentric.z * vertices[idx.z].normal);
+
+            // Interpolate world-space position for light distance/direction calculations
             vec3 worldPos = barycentric.x * vertices[idx.x].position
                           + barycentric.y * vertices[idx.y].position
                           + barycentric.z * vertices[idx.z].position;
 
+            // View direction: unit vector from surface point toward the camera
             vec3 V = normalize(cameraPos - worldPos);
             vec3 albedo = face.color;
 
+            // Dispatch to the selected shading model
             vec3 color;
             if (shadingModel == 1)
                 color = shadePBR(albedo, N, V, worldPos);

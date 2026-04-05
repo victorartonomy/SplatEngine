@@ -1,31 +1,65 @@
 #version 430 core
 
+// pass2_prefix_sum.comp — Phase 1.5: Blelloch exclusive prefix sum over tile counters.
+//
+// Converts the per-tile triangle count array (tileCounters[i] = how many triangles
+// overlap tile i) into per-tile starting offsets (tileOffsets[i] = where in the
+// flat triangle list tile i's entries begin).
+//
+// After this pass:
+//   tileOffsets[0] = 0
+//   tileOffsets[i] = sum(tileCounters[0..i-1])   (exclusive prefix sum)
+//   tileOffsets[numTiles] = total triangle-tile pairs (grand total)
+//
+// Algorithm: Blelloch exclusive prefix sum (parallel scan) using shared memory.
+//   - Up-sweep (reduce): build a partial sum tree, leaves → root.
+//   - Down-sweep: propagate partial sums from root → leaves, inserting the exclusive result.
+//
+// Multi-block strategy (3 dispatches):
+//   pass=0: Each workgroup of 256 threads scans its block in shared memory and stores
+//           the block's total into blockSums[groupID].
+//   pass=1: A single workgroup scans blockSums (exclusive scan of block totals).
+//           Only dispatched when numScanGroups > 1 (multiple blocks needed).
+//   pass=2: Each workgroup adds blockSums[groupID] to all its local offsets, completing
+//           the global exclusive scan. The last thread in the last group also writes
+//           tileOffsets[numTiles] = the grand total, which the CPU reads back in
+//           TileRasterizer::pass2_prefixSum() to know how large the triangle list must be.
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) buffer TileCounterBuffer {
-    uint tileCounters[];
-};
+// Input: per-tile triangle counts written by pass1 (atomicAdd)
+layout(std430, binding = 0) buffer TileCounterBuffer { uint tileCounters[]; };
 
-layout(std430, binding = 1) buffer TileOffsetBuffer {
-    uint tileOffsets[];
-};
+// Output: per-tile starting offsets (exclusive prefix sum of tileCounters)
+// Has numTiles+1 entries — the extra slot holds the grand total
+layout(std430, binding = 1) buffer TileOffsetBuffer  { uint tileOffsets[]; };
 
-layout(std430, binding = 2) buffer BlockSumBuffer {
-    uint blockSums[];
-};
+// Intermediate: per-workgroup block totals, used in the 3-pass multi-block scheme
+layout(std430, binding = 2) buffer BlockSumBuffer    { uint blockSums[]; };
 
+// Shared memory for the in-workgroup scan (one entry per invocation)
 shared uint sharedData[256];
 
+// pass=0: local scan + store block sums
+// pass=1: scan the block sums (single workgroup)
+// pass=2: add block sums back to local offsets + write grand total
 uniform uint numElements;
 uniform uint pass;
 
 void main() {
-    uint globalID = gl_GlobalInvocationID.x;
-    uint localID = gl_LocalInvocationID.x;
-    uint groupID = gl_WorkGroupID.x;
-    uint groupSize = gl_WorkGroupSize.x;
+    uint globalID  = gl_GlobalInvocationID.x;
+    uint localID   = gl_LocalInvocationID.x;
+    uint groupID   = gl_WorkGroupID.x;
+    uint groupSize = gl_WorkGroupSize.x;    // 256
 
+    // =============================================
+    // PASS 0: Local Blelloch scan + store block sum
+    // =============================================
+    // Each 256-thread workgroup independently computes an exclusive prefix sum of its
+    // 256 input values using shared memory. The block's total (sharedData[255] before
+    // it is zeroed) is stored in blockSums[groupID] for the next pass.
     if (pass == 0) {
+        // Load tile counter into shared memory; pad with 0 for out-of-bounds threads
         if (globalID < numElements) {
             sharedData[localID] = tileCounters[globalID];
         } else {
@@ -35,6 +69,10 @@ void main() {
         barrier();
         memoryBarrierShared();
 
+        // --- Up-sweep (reduce) phase ---
+        // Build a binary reduction tree in shared memory.
+        // After d iterations, sharedData[offset*(2i+2)-1] holds the sum of 2^(d+1) values.
+        // Operates on stride `offset` that doubles each level (1→2→4→…→128).
         uint offset = 1;
 
         for (uint d = groupSize >> 1; d > 0; d >>= 1) {
@@ -42,25 +80,29 @@ void main() {
             memoryBarrierShared();
 
             if (localID < d) {
-                uint ai = offset * (2 * localID + 1) - 1;
-                uint bi = offset * (2 * localID + 2) - 1;
-
+                uint ai = offset * (2 * localID + 1) - 1; // Right child index
+                uint bi = offset * (2 * localID + 2) - 1; // Parent index
                 if (bi < groupSize) {
-                    sharedData[bi] += sharedData[ai];
+                    sharedData[bi] += sharedData[ai]; // Accumulate into parent
                 }
             }
-
             offset *= 2;
         }
 
+        // --- Store block total and insert zero (exclusive scan identity) ---
+        // Thread 0 writes the block's total to blockSums, then sets the root to 0.
+        // Setting the root to 0 is the start of the down-sweep (exclusive scan requires 0 at root).
         if (localID == 0) {
-            blockSums[groupID] = sharedData[groupSize - 1];
-            sharedData[groupSize - 1] = 0;
+            blockSums[groupID] = sharedData[groupSize - 1]; // Total for this block
+            sharedData[groupSize - 1] = 0;                  // Clear root for down-sweep
         }
 
         barrier();
         memoryBarrierShared();
 
+        // --- Down-sweep phase ---
+        // Propagate partial sums from root to leaves, producing the exclusive prefix sum.
+        // Each step: left child gets parent's value; right child gets left + parent.
         for (uint d = 1; d < groupSize; d *= 2) {
             offset >>= 1;
             barrier();
@@ -69,11 +111,10 @@ void main() {
             if (localID < d) {
                 uint ai = offset * (2 * localID + 1) - 1;
                 uint bi = offset * (2 * localID + 2) - 1;
-
                 if (bi < groupSize) {
-                    uint temp = sharedData[ai];
-                    sharedData[ai] = sharedData[bi];
-                    sharedData[bi] += temp;
+                    uint temp     = sharedData[ai];
+                    sharedData[ai] = sharedData[bi];     // Left child ← parent
+                    sharedData[bi] += temp;              // Right child ← left + parent
                 }
             }
         }
@@ -81,12 +122,20 @@ void main() {
         barrier();
         memoryBarrierShared();
 
+        // Write the local exclusive prefix sum result back to the tile offset buffer
         if (globalID < numElements) {
             tileOffsets[globalID] = sharedData[localID];
         }
 
+    // =============================================
+    // PASS 1: Scan the block sums (single group)
+    // =============================================
+    // Only dispatched when there are multiple scan groups (i.e., more than 256 tiles).
+    // Performs a Blelloch scan on blockSums[] itself — same algorithm, but operates on
+    // the array of per-block totals rather than per-tile counters.
+    // After this pass, blockSums[i] = sum(blockSums[0..i-1]) (exclusive, global offset per block).
     } else if (pass == 1) {
-        // numElements holds the actual number of block sums to scan
+        // Load block sum; pad with 0 if outside the valid range
         if (localID < numElements) {
             sharedData[localID] = blockSums[localID];
         } else {
@@ -96,24 +145,22 @@ void main() {
         barrier();
         memoryBarrierShared();
 
+        // Up-sweep
         uint offset = 1;
-
         for (uint d = groupSize >> 1; d > 0; d >>= 1) {
             barrier();
             memoryBarrierShared();
-
             if (localID < d) {
                 uint ai = offset * (2 * localID + 1) - 1;
                 uint bi = offset * (2 * localID + 2) - 1;
-
                 if (bi < groupSize) {
                     sharedData[bi] += sharedData[ai];
                 }
             }
-
             offset *= 2;
         }
 
+        // Clear root for down-sweep (no block total to save — not needed in pass 2)
         if (localID == 0) {
             sharedData[groupSize - 1] = 0;
         }
@@ -121,17 +168,16 @@ void main() {
         barrier();
         memoryBarrierShared();
 
+        // Down-sweep
         for (uint d = 1; d < groupSize; d *= 2) {
             offset >>= 1;
             barrier();
             memoryBarrierShared();
-
             if (localID < d) {
                 uint ai = offset * (2 * localID + 1) - 1;
                 uint bi = offset * (2 * localID + 2) - 1;
-
                 if (bi < groupSize) {
-                    uint temp = sharedData[ai];
+                    uint temp     = sharedData[ai];
                     sharedData[ai] = sharedData[bi];
                     sharedData[bi] += temp;
                 }
@@ -141,19 +187,34 @@ void main() {
         barrier();
         memoryBarrierShared();
 
+        // Write scanned block sums back; these are now global offsets per block
         if (localID < numElements) {
             blockSums[localID] = sharedData[localID];
         }
 
+    // =============================================
+    // PASS 2: Add block sums + write grand total
+    // =============================================
+    // Each element in tileOffsets[] currently holds a local (within-block) exclusive sum.
+    // Adding the block's global offset (blockSums[groupID]) converts it to a global exclusive sum.
+    // Group 0 already has the correct offset (blockSums[0] = 0 after the exclusive scan), so
+    // only groups > 0 need the addition.
+    //
+    // The last invocation in the last group also writes the grand total:
+    //   tileOffsets[numTiles] = tileOffsets[numTiles-1] + tileCounters[numTiles-1]
+    // This is the sum of all tile counters and is read back by the CPU in pass2_prefixSum().
     } else if (pass == 2) {
         if (globalID < numElements && groupID > 0) {
-            tileOffsets[globalID] += blockSums[groupID];
+            tileOffsets[globalID] += blockSums[groupID]; // Add per-block global offset
         }
 
         barrier();
-        memoryBarrierBuffer();
+        memoryBarrierBuffer(); // Ensure all writes to tileOffsets are visible before the grand total write
 
+        // Write the grand total into the extra slot at index numTiles
         if (localID == 0 && groupID == gl_NumWorkGroups.x - 1) {
+            // tileOffsets[numTiles-1] is the exclusive sum for the last tile;
+            // adding tileCounters[numTiles-1] gives the inclusive sum = grand total
             tileOffsets[numElements] = tileOffsets[numElements - 1] + tileCounters[numElements - 1];
         }
     }

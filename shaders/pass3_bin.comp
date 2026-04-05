@@ -1,79 +1,101 @@
 #version 430 core
 #extension GL_ARB_gpu_shader_int64 : require
 
+// pass3_bin.comp — Phase 2: Scatter triangle IDs into per-tile lists.
+//
+// Each thread processes one projected triangle and writes its ID into every tile it overlaps.
+// After this pass, triangleList is organized as a flat array of uint triangle IDs, where
+// the entries for tile i occupy indices [tileOffsets[i], tileOffsets[i+1]).
+//
+// Algorithm:
+//   For each tile (tx, ty) in the triangle's AABB:
+//     1. Look up the tile's base offset: tileBaseOffset = tileOffsets[tileIndex]
+//     2. Atomically increment the tile's write cursor: localOffset = atomicAdd(tileWriteOffsets[tileIndex], 1)
+//     3. Write triangleID into triangleList[tileBaseOffset + localOffset]
+//
+// The tileWriteOffsets buffer is initialized to 0 by TileRasterizer::pass3_binTriangles()
+// before this dispatch. The add(tileWriteOffsets[i], 1) acts as a per-tile allocation,
+// so concurrent writes from different triangles never overwrite each other.
+//
+// Triangles marked as invalid in pass1 (aabbMin.x < 0) are skipped.
+// An out-of-bounds guard (globalWriteIndex < maxTriangleListSize) prevents writing outside
+// the triangle list buffer in case the CPU-side capacity estimate was wrong.
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 const int TILE_SIZE = 16;
 
+// ProjectedTriangle: output from pass1, contains screen-space AABB for tile overlap tests
 struct ProjectedTriangle {
-    vec2 v0;
-    vec2 v1;
-    vec2 v2;
-    
+    vec2  v0;
+    vec2  v1;
+    vec2  v2;
+
     float depth0;
     float depth1;
     float depth2;
-    
-    ivec2 aabbMin;
+
+    ivec2 aabbMin; // (-1,-1) marks invalid triangles (behind camera, zero-area, or TDR-capped)
     ivec2 aabbMax;
-    
+
     uint originalFaceIndex;
     uint padding[3];
 };
 
-layout(std430, binding = 0) buffer ProjectedTriangleBuffer {
-    ProjectedTriangle projectedTriangles[];
-};
-
-layout(std430, binding = 1) buffer TileCounterBuffer {
-    uint tileCounters[];
-};
-
-layout(std430, binding = 2) buffer TileOffsetBuffer {
-    uint tileOffsets[];
-};
-
-layout(std430, binding = 3) buffer TriangleListBuffer {
-    uint triangleList[];
-};
-
-layout(std430, binding = 4) buffer TileWriteOffsetBuffer {
-    uint tileWriteOffsets[];
-};
+// SSBO bindings (must match Renderer.cpp pass3 setup):
+//   binding 0: projected triangles (pass1 output)
+//   binding 1: tile counters (pass1 output, read to validate but primary use is pass2)
+//   binding 2: tile offsets  (pass2 output — base offset per tile in triangleList)
+//   binding 3: triangle list (this pass's output — flat array of triangle IDs per tile)
+//   binding 4: tile write offsets (per-tile atomic cursor, reset to 0 before this dispatch)
+layout(std430, binding = 0) buffer ProjectedTriangleBuffer { ProjectedTriangle projectedTriangles[]; };
+layout(std430, binding = 1) buffer TileCounterBuffer       { uint tileCounters[]; };
+layout(std430, binding = 2) buffer TileOffsetBuffer        { uint tileOffsets[]; };
+layout(std430, binding = 3) buffer TriangleListBuffer      { uint triangleList[]; };
+layout(std430, binding = 4) buffer TileWriteOffsetBuffer   { uint tileWriteOffsets[]; };
 
 uniform ivec2 numTiles;
-uniform uint maxTriangleListSize;
+uniform uint  maxTriangleListSize; // Capacity of triangleList[] — guard against overflow
 
 void main() {
-    uint triangleID = gl_GlobalInvocationID.x;
+    uint triangleID  = gl_GlobalInvocationID.x;
     uint numTriangles = projectedTriangles.length();
 
+    // Guard: extra threads beyond the triangle count do nothing
     if (triangleID >= numTriangles) {
         return;
     }
 
     ProjectedTriangle tri = projectedTriangles[triangleID];
 
+    // Skip triangles invalidated by pass1 (behind camera, zero-area, or TDR-capped)
     if (tri.aabbMin.x < 0) {
         return;
     }
 
+    // Convert screen-space AABB to tile coordinates and clamp to valid tile range
     ivec2 tileMin = tri.aabbMin / TILE_SIZE;
     ivec2 tileMax = tri.aabbMax / TILE_SIZE;
 
     tileMin = clamp(tileMin, ivec2(0), numTiles - ivec2(1));
     tileMax = clamp(tileMax, ivec2(0), numTiles - ivec2(1));
 
+    // Write this triangle's ID into the list slot for every tile it overlaps
     for (int ty = tileMin.y; ty <= tileMax.y; ty++) {
         for (int tx = tileMin.x; tx <= tileMax.x; tx++) {
             uint tileIndex = ty * numTiles.x + tx;
 
+            // tileBaseOffset: start of this tile's contiguous block in triangleList[]
             uint tileBaseOffset = tileOffsets[tileIndex];
 
+            // Atomically claim a slot within this tile's block.
+            // Multiple triangles can write to the same tile concurrently — each gets a unique slot.
             uint localOffset = atomicAdd(tileWriteOffsets[tileIndex], 1);
 
             uint globalWriteIndex = tileBaseOffset + localOffset;
 
+            // Bounds check to protect against triangle list overflow (should not happen
+            // after pass2_prefixSum() ensures sufficient capacity, but guards are cheap)
             if (globalWriteIndex < maxTriangleListSize) {
                 triangleList[globalWriteIndex] = triangleID;
             }
