@@ -29,11 +29,12 @@ struct Vertex {
     vec3 normal;
 };
 
-// Face: indices into the vertex buffer + per-face color (std430 layout — see Mesh.h)
+// Face: indices into the vertex buffer + per-face color + material ID (std430 layout — see Mesh.h)
+// pass1 only reads face.indices, but the struct layout must exactly match the C++ Face struct.
 struct Face {
     uvec3 indices;
-    vec3 color;
-    float padding;
+    vec3  color;
+    uint  materialID;  // was: float padding — updated to match Face in Mesh.h
 };
 
 // ProjectedTriangle: output of this pass, input to pass3/pass4 (std430 — see TileData.h)

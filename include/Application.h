@@ -45,7 +45,8 @@ private:
     // Scene
     Camera m_camera{glm::vec3(0.0f, 0.0f, 100.0f)};
     Scene  m_scene;
-    int    m_selectedEntity = -1;   // index into m_scene.getEntities(), or -1
+    int    m_selectedEntity   = -1;  // index into m_scene.getEntities(), or -1
+    int    m_selectedMaterial =  0;  // index into MaterialManager's material array
 
     // Input
     InputManager m_inputManager;

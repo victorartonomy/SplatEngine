@@ -231,6 +231,7 @@ void Application::update() {
         ImGui::DockBuilderDockWindow("Asset Manager",     dockRightTop);    // Tabbed with Scene Hierarchy
         ImGui::DockBuilderDockWindow("Camera Settings",   dockRightBottom); // Lower-right: camera/lighting
         ImGui::DockBuilderDockWindow("Lighting",          dockRightBottom); // Tabbed with Camera Settings
+        ImGui::DockBuilderDockWindow("Materials",         dockRightBottom); // Tabbed with Camera Settings
         ImGui::DockBuilderDockWindow("Mouse",             dockRightBottom); // Tabbed with Camera Settings
         ImGui::DockBuilderFinish(dockspaceId);
     }
@@ -671,6 +672,64 @@ void Application::update() {
             if (ImGui::Selectable(label, m_selectedEntity == i))
                 m_selectedEntity = i; // Cross-select: clicking a light here selects it in the hierarchy
             ImGui::PopID();
+        }
+    }
+    ImGui::End();
+
+    // =============================================
+    // MATERIALS WINDOW
+    // =============================================
+    ImGui::Begin("Materials");
+    {
+        // Clamp selection in case the material list was modified since last frame
+        int matCount = m_renderer.getMaterialManager().getMaterialCount();
+        if (m_selectedMaterial >= matCount) m_selectedMaterial = 0;
+
+        // Add a new material with neutral defaults and immediately select it
+        if (ImGui::Button("Add Material")) {
+            GPUMaterial newMat{};
+            newMat.albedo    = glm::vec3(1.0f);
+            newMat.metallic  = 0.0f;
+            newMat.roughness = 0.5f;
+            newMat.emissive  = 0.0f;
+            newMat._pad0     = 0.0f;
+            newMat._pad1     = 0.0f;
+            m_selectedMaterial = static_cast<int>(
+                m_renderer.getMaterialManager().addMaterial(newMat));
+            m_renderer.getMaterialManager().upload();
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Materials (%d)", matCount);
+
+        // Scrollable selectable list of material slots
+        for (int i = 0; i < matCount; i++) {
+            ImGui::PushID(i);
+            char label[64];
+            snprintf(label, sizeof(label), i == 0 ? "Material %d (default)" : "Material %d", i);
+            if (ImGui::Selectable(label, m_selectedMaterial == i))
+                m_selectedMaterial = i;
+            ImGui::PopID();
+        }
+
+        // Inspector for the selected material slot
+        if (m_selectedMaterial < matCount) {
+            ImGui::Separator();
+            // Copy → edit → write back pattern avoids partial updates to the GPU array
+            GPUMaterial mat = m_renderer.getMaterialManager().getMaterial(
+                static_cast<uint32_t>(m_selectedMaterial));
+
+            bool changed = false;
+            changed |= ImGui::ColorEdit3("Albedo",    &mat.albedo.x);
+            changed |= ImGui::SliderFloat("Metallic",  &mat.metallic,  0.0f, 1.0f);
+            changed |= ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
+            changed |= ImGui::SliderFloat("Emissive",  &mat.emissive,  0.0f, 10.0f);
+
+            if (changed) {
+                m_renderer.getMaterialManager().setMaterial(
+                    static_cast<uint32_t>(m_selectedMaterial), mat);
+                m_renderer.getMaterialManager().upload();  // Push to GPU immediately
+            }
         }
     }
     ImGui::End();

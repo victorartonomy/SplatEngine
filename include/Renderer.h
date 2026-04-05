@@ -8,6 +8,7 @@
 #include "ComputeShader.h"
 #include "GPUBuffer.h"
 #include "LightManager.h"
+#include "MaterialManager.h"
 #include "Mesh.h"
 #include "Scene.h"
 #include "TileRasterizer.h"
@@ -45,7 +46,8 @@ public:
     void setDebugMode(bool enabled) { m_debugMode = enabled; }
     bool getDebugMode()       const { return m_debugMode;    }
 
-    LightManager& getLightManager() { return m_lightManager; }
+    LightManager&    getLightManager()    { return m_lightManager;    }
+    MaterialManager& getMaterialManager() { return m_materialManager; }
 
 private:
     GLuint createOutputTexture(int width, int height);
@@ -73,7 +75,8 @@ private:
     Mesh      m_mergedMesh;
     GPUBuffer m_mergedGpuBuffer;
 
-    LightManager m_lightManager;
+    LightManager    m_lightManager;
+    MaterialManager m_materialManager;
 
     bool m_sceneDirty = true;   // safety net: auto-submit on first render if missed
     bool m_debugMode  = false;

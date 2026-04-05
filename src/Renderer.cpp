@@ -85,6 +85,11 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
     m_tileRasterizer = std::make_unique<TileRasterizer>(viewportWidth, viewportHeight);
     m_tileRasterizer->initialize(1); // Placeholder — resized on first mesh load
 
+    // Upload the default material (slot 0) to the GPU.
+    // All faces parsed from COFF files are assigned materialID=0, so existing meshes
+    // render identically: face.color × albedo(1,1,1) = face.color.
+    m_materialManager.upload();
+
     return true;
 }
 
@@ -100,6 +105,7 @@ void Renderer::shutdown() {
     glDeleteTextures(1, &m_depthBuffer);   m_depthBuffer   = 0;
 
     m_lightManager.shutdown();
+    m_materialManager.shutdown();
     m_tileRasterizer.reset();
     m_clearDepthShader.reset();
     m_clearTilesShader.reset();
@@ -364,6 +370,7 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_tileRasterizer->getTileOffsetBufferID());
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_tileRasterizer->getTriangleListBufferID());
         m_lightManager.bind(7);
+        m_materialManager.bind(8);  // binding 8: GPUMaterial array
 
         m_pass4Shader->setIVec2("screenSize",
                                 glm::ivec2(m_viewportWidth, m_viewportHeight));
@@ -371,6 +378,7 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
                                 glm::ivec2(m_tileRasterizer->getNumTilesX(),
                                            m_tileRasterizer->getNumTilesY()));
         m_pass4Shader->setInt("numLights",    m_lightManager.getLightCount());
+        m_pass4Shader->setInt("numMaterials", m_materialManager.getMaterialCount());
         m_pass4Shader->setVec3("cameraPos",   camera.getPosition());
         m_pass4Shader->setInt("shadingModel", static_cast<int>(m_lightManager.getShadingModel()));
         m_pass4Shader->dispatch(numGroupsX, numGroupsY, 1);

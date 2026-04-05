@@ -242,7 +242,7 @@ bool COFFParser::parseFaces(std::ifstream& file, size_t faceCount, std::vector<F
 
         // Zero padding fields to satisfy the std430 Face struct layout
         face._pad0    = 0;
-        face.padding  = 0.0f;
+        face.materialID = 0;  // Default material — slot 0 in MaterialManager
         faces.push_back(face);
 
         if (i % 200000 == 0 && i > 0) {

@@ -42,11 +42,11 @@ struct Vertex {
     vec3 normal;
 };
 
-// Face: vertex indices into the merged vertex buffer + per-face color
+// Face: vertex indices into the merged vertex buffer + per-face color + material slot
 struct Face {
     uvec3 indices;
-    vec3  color;
-    float padding;
+    vec3  color;       // per-face RGB tint (from COFF file)
+    uint  materialID;  // index into materials[] SSBO (binding 8)
 };
 
 // ProjectedTriangle: pass1 output — screen-space positions, NDC depths, AABB
@@ -76,6 +76,15 @@ struct GPULight {
     float _pad0;       float _pad1;
 };
 
+// GPUMaterial — 32-byte std430 struct. See GPUMaterial in Mesh.h for byte-offset layout.
+// Slot 0 is the default white/neutral material (albedo=1,1,1; metallic=0; roughness=0.5; emissive=0).
+// final_albedo = face.color × mat.albedo → default preserves original face color.
+struct GPUMaterial {
+    vec3  albedo;     float metallic;    // bytes  0–15
+    float roughness;  float emissive;    // bytes 16–23
+    float _p0;        float _p1;         // bytes 24–31 (padding)
+};
+
 // SSBO binding layout (must match Renderer.cpp pass4 setup):
 //   binding 2: vertex SSBO
 //   binding 3: face SSBO
@@ -83,16 +92,19 @@ struct GPULight {
 //   binding 5: tile offset buffer (pass2 output — per-tile start in triangleList)
 //   binding 6: triangle list buffer (pass3 output — flat list of triangle IDs per tile)
 //   binding 7: light SSBO (LightManager output — GPULight array)
+//   binding 8: material SSBO (MaterialManager output — GPUMaterial array)
 layout(std430, binding = 2) buffer VertexBuffer            { Vertex vertices[]; };
 layout(std430, binding = 3) buffer FaceBuffer              { Face faces[]; };
 layout(std430, binding = 4) buffer ProjectedTriangleBuffer { ProjectedTriangle projectedTriangles[]; };
 layout(std430, binding = 5) buffer TileOffsetBuffer        { uint tileOffsets[]; };
 layout(std430, binding = 6) buffer TriangleListBuffer      { uint triangleList[]; };
 layout(std430, binding = 7) buffer LightBuffer             { GPULight lights[]; };
+layout(std430, binding = 8) buffer MaterialBuffer          { GPUMaterial materials[]; };
 
 uniform ivec2 screenSize;
 uniform ivec2 numTiles;
 uniform int   numLights;
+uniform int   numMaterials;
 uniform vec3  cameraPos;
 uniform int   shadingModel; // 0 = Blinn-Phong, 1 = PBR
 
@@ -256,15 +268,13 @@ vec3 shadeBlinnPhong(vec3 albedo, vec3 N, vec3 V, vec3 worldPos) {
 }
 
 // PBR (Cook-Torrance) shading with metallic-roughness workflow.
-// Uses constant metallic=0, roughness=0.5 (dielectric surface, medium roughness).
+// metallic and roughness are now per-material parameters from the GPUMaterial SSBO.
 // F0: specular reflectance at normal incidence — 0.04 for dielectrics, albedo for metals.
 //
 // BRDF = (kD * albedo/π + specular) * radiance * NdotL
 //   where specular = (D * G * F) / (4 * NdotV * NdotL)
 //   kD = diffuse weight = (1 - F) * (1 - metallic)  [energy conservation]
-vec3 shadePBR(vec3 albedo, vec3 N, vec3 V, vec3 worldPos) {
-    float metallic  = 0.0;
-    float roughness = 0.5;
+vec3 shadePBR(vec3 albedo, vec3 N, vec3 V, vec3 worldPos, float metallic, float roughness) {
     // F0: linear interpolation between dielectric (0.04) and metallic (albedo)
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
@@ -367,14 +377,23 @@ void main() {
 
             // View direction: unit vector from surface point toward the camera
             vec3 V = normalize(cameraPos - worldPos);
-            vec3 albedo = face.color;
+
+            // Resolve material: clamp materialID to the valid range so out-of-bounds IDs
+            // fall back to slot 0 (default white material) rather than reading garbage memory
+            GPUMaterial mat = materials[clamp(int(face.materialID), 0, numMaterials - 1)];
+
+            // Blend face tint with material albedo — default albedo (1,1,1) preserves face color
+            vec3 albedo = face.color * mat.albedo;
 
             // Dispatch to the selected shading model
             vec3 color;
             if (shadingModel == 1)
-                color = shadePBR(albedo, N, V, worldPos);
+                color = shadePBR(albedo, N, V, worldPos, mat.metallic, mat.roughness);
             else
                 color = shadeBlinnPhong(albedo, N, V, worldPos);
+
+            // Emissive contribution: surface glows with its own blended albedo
+            color += albedo * mat.emissive;
 
             imageStore(outputImage, pixelCoords, vec4(color, 1.0));
         }

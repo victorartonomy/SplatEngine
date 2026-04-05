@@ -95,6 +95,7 @@ add_executable(Engine
     src/InputManager.cpp
     src/EventBus.cpp
     src/LightManager.cpp
+    src/MaterialManager.cpp
 )
 
 # Include directories for the Engine
