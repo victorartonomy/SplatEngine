@@ -694,7 +694,7 @@ void Application::update() {
             newMat.roughness = 0.5f;
             newMat.emissive  = 0.0f;
             newMat.textureID = -1;
-            newMat._pad1     = 0.0f;
+            newMat.alpha     = 1.0f;  // Start fully opaque; user can reduce via slider
             m_selectedMaterial = static_cast<int>(
                 m_renderer.getMaterialManager().addMaterial(newMat));
             m_renderer.getMaterialManager().upload();
@@ -725,6 +725,10 @@ void Application::update() {
             changed |= ImGui::SliderFloat("Metallic",  &mat.metallic,  0.0f, 1.0f);
             changed |= ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
             changed |= ImGui::SliderFloat("Emissive",  &mat.emissive,  0.0f, 10.0f);
+            // Alpha: 1.0 = fully opaque (depth-tested). Values below 0.99 activate
+            // Weighted Blended OIT — the fragment is accumulated into the transparent
+            // layer and composited over the opaque image by pass5_oit_composite.comp.
+            changed |= ImGui::SliderFloat("Alpha",     &mat.alpha,     0.0f, 1.0f);
 
             // Texture selector: "None" or one of the loaded texture layers
             {

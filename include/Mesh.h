@@ -35,14 +35,17 @@ static_assert(sizeof(Face) == 32, "Face must be 32 bytes for std430");
 // One entry per material slot. Face::materialID indexes into this array.
 // Slot 0 is always a default white/neutral material:
 //   albedo = (1,1,1)  →  face.color × (1,1,1) = face.color  (no visual change for existing meshes)
-//   metallic = 0, roughness = 0.5, emissive = 0
+//   metallic = 0, roughness = 0.5, emissive = 0, alpha = 1 (fully opaque)
 struct GPUMaterial {
     glm::vec3 albedo;    // bytes  0–11: base color multiplied with face.color in the shader
     float     metallic;  // bytes 12–15: 0=dielectric, 1=full metal (PBR Cook-Torrance only)
     float     roughness; // bytes 16–19: 0=mirror smooth, 1=fully diffuse (PBR only)
     float     emissive;  // bytes 20–23: emissive intensity; final += albedo × emissive
     int       textureID; // bytes 24–27: -1 = no texture; 0+ = layer index into GL_TEXTURE_2D_ARRAY
-    float     _pad1;     // bytes 28–31: explicit padding to reach 32-byte struct size
+    // Transparency: 1.0 = fully opaque (depth-tested, no blending).
+    // Values < 0.99 route the fragment through Weighted Blended OIT (pass4 accumulate,
+    // pass5 composite) instead of the opaque depth-write path.
+    float     alpha;     // bytes 28–31: material transparency [0,1]. Replaces former _pad1.
 };
 static_assert(sizeof(GPUMaterial) == 32, "GPUMaterial must be 32 bytes for std430");
 

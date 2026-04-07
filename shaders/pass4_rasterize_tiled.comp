@@ -86,13 +86,15 @@ struct GPULight {
 };
 
 // GPUMaterial — 32-byte std430 struct. See GPUMaterial in Mesh.h for byte-offset layout.
-// Slot 0 is the default white/neutral material (albedo=1,1,1; metallic=0; roughness=0.5; emissive=0).
+// Slot 0 is the default white/neutral material (albedo=1,1,1; metallic=0; roughness=0.5; emissive=0; alpha=1).
 // final_albedo = face.color × mat.albedo → default preserves original face color.
 // textureID: -1 = no texture (face.color × albedo only); 0+ = layer index in textureAtlas.
+// alpha: 1.0 = fully opaque (depth-tested, single winner per pixel).
+//        < 0.99 = transparent → fragment is accumulated via WBOIT into the OIT SSBOs.
 struct GPUMaterial {
     vec3  albedo;     float metallic;    // bytes  0–15
     float roughness;  float emissive;    // bytes 16–23
-    int   textureID;  float _p1;         // bytes 24–31 (textureID replaces former _p0)
+    int   textureID;  float alpha;       // bytes 24–31 (alpha replaces former _p1 padding)
 };
 
 // SSBO binding layout (must match Renderer.cpp pass4 setup):
@@ -103,6 +105,7 @@ struct GPUMaterial {
 //   binding 6: triangle list buffer (pass3 output — flat list of triangle IDs per tile)
 //   binding 7: light SSBO (LightManager output — GPULight array)
 //   binding 8: material SSBO (MaterialManager output — GPUMaterial array)
+//   bindings 9-13: OIT accumulation SSBOs (see below)
 layout(std430, binding = 2) buffer VertexBuffer            { Vertex vertices[]; };
 layout(std430, binding = 3) buffer FaceBuffer              { Face faces[]; };
 layout(std430, binding = 4) buffer ProjectedTriangleBuffer { ProjectedTriangle projectedTriangles[]; };
@@ -110,6 +113,28 @@ layout(std430, binding = 5) buffer TileOffsetBuffer        { uint tileOffsets[];
 layout(std430, binding = 6) buffer TriangleListBuffer      { uint triangleList[]; };
 layout(std430, binding = 7) buffer LightBuffer             { GPULight lights[]; };
 layout(std430, binding = 8) buffer MaterialBuffer          { GPUMaterial materials[]; };
+
+// OIT accumulation buffers — written by this pass, read by pass5_oit_composite.comp.
+//
+// Each buffer stores one float per pixel, packed into a uint32 using floatBitsToUint so
+// that it can live in a plain SSBO without needing any GLSL extension.
+//
+// Pixel index:  idx = pixelCoords.y * screenSize.x + pixelCoords.x
+//
+// No atomics are needed here: the tile layout assigns exactly one thread per pixel
+// (16×16 tile = 16×16 threads), and tiles are non-overlapping. Each pixel is therefore
+// written by exactly one thread — plain SSBO stores are safe.
+//
+// Contents after pass4 completes (per pixel):
+//   oitAccumR/G/B: sum(channel * alpha * weight)  — WBOIT weighted color
+//   oitAccumA:     sum(alpha * weight)             — WBOIT weighted alpha sum
+//   oitReveal:     product(1 - alpha_i)            — accumulated transmittance [0,1]
+//                  1.0 = no transparent fragments; 0.0 = fully covered
+layout(std430, binding = 9)  buffer OITAccumR { uint oitAccumR[]; };
+layout(std430, binding = 10) buffer OITAccumG { uint oitAccumG[]; };
+layout(std430, binding = 11) buffer OITAccumB { uint oitAccumB[]; };
+layout(std430, binding = 12) buffer OITAccumA { uint oitAccumA[]; };
+layout(std430, binding = 13) buffer OITReveal  { uint oitReveal[];  };
 
 // Shadow map (R32UI) bound at image unit 9. Read with imageLoad and bit-cast back to float.
 // Written by shadow_pass.comp using floatBitsToUint(depth) + imageAtomicMin.
@@ -400,97 +425,185 @@ vec3 shadePBR(vec3 albedo, vec3 N, vec3 V, vec3 worldPos, float metallic, float 
 void main() {
     ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
 
-    // Guard: discard threads outside the viewport (edge tiles may extend beyond screen)
+    // Guard: discard threads outside the viewport (edge tiles may extend beyond screen).
+    // Note: OIT buffers are sized width×height, so out-of-bounds threads must NOT write.
     if (pixelCoords.x >= screenSize.x || pixelCoords.y >= screenSize.y)
         return;
 
-    // Determine which tile this pixel belongs to and read its triangle range
+    // Flat pixel index into the OIT SSBOs (row-major, matching the buffer allocation).
+    int pixelIdx = pixelCoords.y * screenSize.x + pixelCoords.x;
+
+    // Determine which tile this pixel belongs to and read its triangle range.
     ivec2 tileCoords = pixelCoords / TILE_SIZE;
     uint tileIndex = tileCoords.y * numTiles.x + tileCoords.x;
 
-    // [tileStart, tileEnd) is the half-open range of this tile's entries in triangleList[]
+    // [tileStart, tileEnd) is the half-open range of this tile's entries in triangleList[].
     uint tileStart = tileOffsets[tileIndex];
     uint tileEnd   = tileOffsets[tileIndex + 1];
     uint numTrianglesInTile = tileEnd - tileStart;
 
-    // Initialize output pixel to black; skip entirely if this tile has no triangles
+    // Initialize output pixel to black (background color).
     imageStore(outputImage, pixelCoords, vec4(0.0, 0.0, 0.0, 1.0));
-    if (numTrianglesInTile == 0)
-        return;
 
-    // Test against the center of the pixel (not the corner) for correct sub-pixel coverage
-    vec2 pixelCenter = vec2(pixelCoords) + vec2(0.5);
+    // Thread-local OIT accumulation state for this pixel.
+    // These live entirely in registers — no memory until the final write below.
+    // Initialized to "no transparent fragments" state:
+    //   accum channels = 0 (no contribution yet)
+    //   reveal = 1.0    (full transmittance — nothing is blocking the opaque surface)
+    float localAccumR = 0.0;
+    float localAccumG = 0.0;
+    float localAccumB = 0.0;
+    float localAccumA = 0.0;
+    float localReveal = 1.0;
 
-    for (uint i = 0; i < numTrianglesInTile; i++) {
-        uint triangleID = triangleList[tileStart + i];
-        ProjectedTriangle tri = projectedTriangles[triangleID];
+    // Process triangles only if this tile has any (avoids the loop overhead entirely).
+    if (numTrianglesInTile > 0) {
+        // Test against the center of the pixel (not the corner) for correct sub-pixel coverage.
+        vec2 pixelCenter = vec2(pixelCoords) + vec2(0.5);
 
-        // Point-in-triangle test with barycentric coordinate output
-        vec3 barycentric;
-        if (!pointInTriangle(pixelCenter, tri.v0, tri.v1, tri.v2, barycentric))
-            continue;
+        for (uint i = 0; i < numTrianglesInTile; i++) {
+            uint triangleID = triangleList[tileStart + i];
+            ProjectedTriangle tri = projectedTriangles[triangleID];
 
-        // Barycentric interpolation of NDC depth for depth testing
-        float interpolatedDepth = barycentric.x * tri.depth0 +
-                                  barycentric.y * tri.depth1 +
-                                  barycentric.z * tri.depth2;
+            // Point-in-triangle test with barycentric coordinate output.
+            vec3 barycentric;
+            if (!pointInTriangle(pixelCenter, tri.v0, tri.v1, tri.v2, barycentric))
+                continue;
 
-        // Encode to uint and perform atomic depth test.
-        // imageAtomicMin returns the *old* depth value:
-        //   if depthUInt < oldDepth → this triangle is closer → write its color
-        //   if depthUInt >= oldDepth → another triangle already won → skip
-        uint depthUInt = encodeDepth(interpolatedDepth);
-        uint oldDepth  = imageAtomicMin(depthBuffer, pixelCoords, depthUInt);
+            // Barycentric interpolation of NDC depth (used for depth testing and WBOIT weight).
+            float interpolatedDepth = barycentric.x * tri.depth0 +
+                                      barycentric.y * tri.depth1 +
+                                      barycentric.z * tri.depth2;
 
-        if (depthUInt <= oldDepth) {
-            // This pixel is now owned by this triangle — shade it
+            // Read face and resolve material early so we can branch on alpha.
+            // Clamping materialID prevents out-of-bounds reads on corrupt data.
             Face face = faces[tri.originalFaceIndex];
-            uvec3 idx = face.indices;
-
-            // Interpolate per-vertex normal from the 3 triangle vertices
-            // Renormalize after interpolation since barycentric-weighted normals aren't unit-length
-            vec3 N = normalize(barycentric.x * vertices[idx.x].normal
-                             + barycentric.y * vertices[idx.y].normal
-                             + barycentric.z * vertices[idx.z].normal);
-
-            // Interpolate world-space position for light distance/direction calculations
-            vec3 worldPos = barycentric.x * vertices[idx.x].position
-                          + barycentric.y * vertices[idx.y].position
-                          + barycentric.z * vertices[idx.z].position;
-
-            // Interpolate per-vertex UV (planar projection — barycentric is acceptable)
-            vec2 uv = barycentric.x * vertices[idx.x].uv
-                    + barycentric.y * vertices[idx.y].uv
-                    + barycentric.z * vertices[idx.z].uv;
-
-            // View direction: unit vector from surface point toward the camera
-            vec3 V = normalize(cameraPos - worldPos);
-
-            // Resolve material: clamp materialID to the valid range so out-of-bounds IDs
-            // fall back to slot 0 (default white material) rather than reading garbage memory
             GPUMaterial mat = materials[clamp(int(face.materialID), 0, numMaterials - 1)];
+            float matAlpha = mat.alpha;
 
-            // Blend face tint, material albedo, and optional texture sample.
-            // textureID == -1 preserves pre-texture behavior exactly.
-            vec3 albedo;
-            if (mat.textureID >= 0) {
-                vec4 texSample = texture(textureAtlas, vec3(uv, float(mat.textureID)));
-                albedo = face.color * mat.albedo * texSample.rgb;
+            if (matAlpha >= 0.99) {
+                // ── Opaque path (unchanged from pre-OIT behavior) ──────────────────────
+                // Atomic min depth test: only the closest opaque triangle writes color.
+                // imageAtomicMin returns the OLD value; if our depth is smaller, we won.
+                uint depthUInt = encodeDepth(interpolatedDepth);
+                uint oldDepth  = imageAtomicMin(depthBuffer, pixelCoords, depthUInt);
+
+                if (depthUInt <= oldDepth) {
+                    uvec3 idx = face.indices;
+
+                    // Interpolate per-vertex normal; renormalize because barycentric
+                    // blending of unit vectors is not generally unit-length.
+                    vec3 N = normalize(barycentric.x * vertices[idx.x].normal
+                                     + barycentric.y * vertices[idx.y].normal
+                                     + barycentric.z * vertices[idx.z].normal);
+
+                    // World-space position for light distance and direction calculations.
+                    vec3 worldPos = barycentric.x * vertices[idx.x].position
+                                  + barycentric.y * vertices[idx.y].position
+                                  + barycentric.z * vertices[idx.z].position;
+
+                    // Per-vertex UV (planar XY projection from COFFParser).
+                    vec2 uv = barycentric.x * vertices[idx.x].uv
+                            + barycentric.y * vertices[idx.y].uv
+                            + barycentric.z * vertices[idx.z].uv;
+
+                    // Unit vector from surface toward the camera for specular calculations.
+                    vec3 V = normalize(cameraPos - worldPos);
+
+                    // Combine face tint, material albedo, and optional texture sample.
+                    vec3 albedo;
+                    if (mat.textureID >= 0) {
+                        vec4 texSample = texture(textureAtlas, vec3(uv, float(mat.textureID)));
+                        albedo = face.color * mat.albedo * texSample.rgb;
+                    } else {
+                        albedo = face.color * mat.albedo;
+                    }
+
+                    // Shade with the selected lighting model.
+                    vec3 color;
+                    if (shadingModel == 1)
+                        color = shadePBR(albedo, N, V, worldPos, mat.metallic, mat.roughness);
+                    else
+                        color = shadeBlinnPhong(albedo, N, V, worldPos);
+
+                    // Self-emission adds on top of the shaded result.
+                    color += albedo * mat.emissive;
+
+                    imageStore(outputImage, pixelCoords, vec4(color, 1.0));
+                }
+
             } else {
-                albedo = face.color * mat.albedo;
+                // ── Transparent path: Weighted Blended OIT (McGuire & Bavoil 2013) ────
+                // No depth test — all overlapping transparent fragments contribute.
+                // Their weighted sum is composited over the opaque layer by pass5.
+
+                uvec3 idx = face.indices;
+
+                // Same interpolation as the opaque path.
+                vec3 N = normalize(barycentric.x * vertices[idx.x].normal
+                                 + barycentric.y * vertices[idx.y].normal
+                                 + barycentric.z * vertices[idx.z].normal);
+
+                vec3 worldPos = barycentric.x * vertices[idx.x].position
+                              + barycentric.y * vertices[idx.y].position
+                              + barycentric.z * vertices[idx.z].position;
+
+                vec2 uv = barycentric.x * vertices[idx.x].uv
+                        + barycentric.y * vertices[idx.y].uv
+                        + barycentric.z * vertices[idx.z].uv;
+
+                vec3 V = normalize(cameraPos - worldPos);
+
+                vec3 albedo;
+                if (mat.textureID >= 0) {
+                    vec4 texSample = texture(textureAtlas, vec3(uv, float(mat.textureID)));
+                    albedo = face.color * mat.albedo * texSample.rgb;
+                } else {
+                    albedo = face.color * mat.albedo;
+                }
+
+                vec3 color;
+                if (shadingModel == 1)
+                    color = shadePBR(albedo, N, V, worldPos, mat.metallic, mat.roughness);
+                else
+                    color = shadeBlinnPhong(albedo, N, V, worldPos);
+
+                color += albedo * mat.emissive;
+
+                // WBOIT weight function (Equation 9 from McGuire & Bavoil 2013).
+                // Weight is large for near, high-alpha fragments and small for far,
+                // low-alpha ones — this produces visually correct layering without sorting.
+                // linearDepth maps NDC [-1,1] to view-space [0,1].
+                float linearDepth = clamp((interpolatedDepth + 1.0) * 0.5, 0.0, 1.0);
+                float depthSq     = linearDepth * linearDepth;
+                float w = clamp(matAlpha * 8.0 + 0.01, 0.01, 3000.0)
+                        * clamp(0.03 / (1e-5 + depthSq), 1e-2, 3e3);
+
+                // Accumulate premultiplied-alpha weighted color into thread-local registers.
+                // These are safe non-atomic writes — each pixel is handled by exactly one thread.
+                localAccumR += color.r * matAlpha * w;
+                localAccumG += color.g * matAlpha * w;
+                localAccumB += color.b * matAlpha * w;
+                localAccumA += matAlpha * w;
+
+                // Multiply transmittance by (1 - alpha): product over all transparent frags
+                // at this pixel gives the fraction of light that reaches the opaque layer.
+                // reveal = 1.0: fully transparent (opaque surface shows through completely).
+                // reveal → 0.0: covered by increasingly opaque transparent fragments.
+                localReveal *= (1.0 - matAlpha);
             }
-
-            // Dispatch to the selected shading model
-            vec3 color;
-            if (shadingModel == 1)
-                color = shadePBR(albedo, N, V, worldPos, mat.metallic, mat.roughness);
-            else
-                color = shadeBlinnPhong(albedo, N, V, worldPos);
-
-            // Emissive contribution: surface glows with its own blended albedo
-            color += albedo * mat.emissive;
-
-            imageStore(outputImage, pixelCoords, vec4(color, 1.0));
         }
     }
+
+    // Write final OIT state for this pixel to the SSBO arrays.
+    // floatBitsToUint() preserves the exact IEEE 754 bit pattern so pass5 can unpack
+    // with uintBitsToFloat() without any loss of precision.
+    //
+    // This write is unconditional: empty-tile pixels write neutral values
+    // (all zeros + reveal=1.0) so pass5 will leave them untouched.
+    oitAccumR[pixelIdx] = floatBitsToUint(localAccumR);
+    oitAccumG[pixelIdx] = floatBitsToUint(localAccumG);
+    oitAccumB[pixelIdx] = floatBitsToUint(localAccumB);
+    oitAccumA[pixelIdx] = floatBitsToUint(localAccumA);
+    oitReveal[pixelIdx] = floatBitsToUint(localReveal);
 }

@@ -56,6 +56,9 @@ private:
     GLuint createDepthBuffer(int width, int height);
     // Create the R32UI shadow map texture used by the shadow pass and sampled in pass4.
     GLuint createShadowMap(int size);
+    // Allocate (or reallocate) all 5 OIT accumulation SSBOs to hold width×height uint32 values.
+    // Called from initialize() and resize() whenever the viewport dimensions change.
+    void   createOITBuffers(int width, int height);
 
     // Compute shaders
     std::unique_ptr<ComputeShader> m_clearDepthShader;
@@ -64,6 +67,9 @@ private:
     std::unique_ptr<ComputeShader> m_pass2Shader;
     std::unique_ptr<ComputeShader> m_pass3Shader;
     std::unique_ptr<ComputeShader> m_pass4Shader;
+    // OIT composite pass: reads OIT accumulation SSBOs written by pass4 and blends
+    // weighted transparent geometry over the opaque output image.
+    std::unique_ptr<ComputeShader> m_pass5OITShader;
     std::unique_ptr<ComputeShader> m_debugTilesShader;
     // Shadow mapping shaders — clear the shadow map then rasterise scene depth from the light.
     std::unique_ptr<ComputeShader> m_clearShadowShader;
@@ -79,6 +85,23 @@ private:
     // 2048×2048 gives reasonable quality without huge memory cost (~16 MB).
     GLuint m_shadowMapTexture = 0;
     int    m_shadowMapSize    = 2048;
+
+    // OIT (Weighted Blended Order-Independent Transparency) accumulation SSBOs.
+    // Each buffer stores one float per pixel, packed as a uint32 via floatBitsToUint.
+    // pass4 writes thread-locally accumulated WBOIT data for each pixel at the end of main().
+    // pass5 reads these and composites transparent fragments over the opaque output image.
+    //
+    // Buffer contents per pixel (SSBO bindings 9-13):
+    //   oitAccumR/G/B: sum(channel * alpha * weight) — weighted color accumulation
+    //   oitAccumA:     sum(alpha * weight)             — weighted alpha accumulation
+    //   oitReveal:     product(1 - alpha_i)            — transmittance (1=fully unoccluded)
+    //
+    // These are resized in Renderer::resize() alongside the depth buffer.
+    GLuint m_oitAccumR = 0;  // SSBO binding 9
+    GLuint m_oitAccumG = 0;  // SSBO binding 10
+    GLuint m_oitAccumB = 0;  // SSBO binding 11
+    GLuint m_oitAccumA = 0;  // SSBO binding 12
+    GLuint m_oitReveal = 0;  // SSBO binding 13
 
     // Tile pipeline
     std::unique_ptr<TileRasterizer> m_tileRasterizer;

@@ -4,79 +4,82 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build Commands
 
-```bash
-# Configure (Windows/MSVC)
-cmake -B build -G "Visual Studio 18 2026" -A x64
+`cmake` is not on the system PATH. Use MSBuild or the VS-bundled cmake directly:
 
-# Build
-cmake --build build --config Release
+```bash
+# Configure (first time only)
+"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -B build -G "Visual Studio 18 2026" -A x64
+
+# Build (Release)
+"C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe" build\Engine.vcxproj /p:Configuration=Release /p:Platform=x64 /m /v:minimal
 
 # Run
-./build/Release/Engine.exe
-
-# Linux alternative
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-./build/Engine
+build\Release\Engine.exe
 ```
 
-CMake presets are configured for Visual Studio 18 2026. Dependencies (GLFW, GLM, Dear ImGui docking branch, Native File Dialog Extended, GLAD) are all auto-fetched via FetchContent -- no manual installs needed.
+Dependencies (GLFW, GLM, Dear ImGui docking branch, Native File Dialog Extended, GLAD) are all auto-fetched via FetchContent — no manual installs needed.
 
-Shaders and models are auto-copied to the build directory via post-build commands. After editing a shader, you must rebuild (or manually copy) for changes to take effect.
+Shaders and models are auto-copied to the build directory via post-build commands. After editing a shader, you must rebuild (or manually copy the file) for changes to take effect.
 
 There are no tests or linting configured.
 
 ## Architecture
 
-This is a **Triangle Splatting** renderer -- a compute-shader-only rendering engine. There is NO traditional vertex/fragment graphics pipeline for geometry. All projection, binning, rasterization, and depth testing run as compute shader dispatches. The screen is divided into 16x16 pixel tiles for efficient per-pixel work.
+This is a **Triangle Splatting** renderer — a compute-shader-only rendering engine. There is NO traditional vertex/fragment graphics pipeline for geometry. All projection, binning, rasterization, depth testing, and transparency run as compute shader dispatches. The screen is divided into 16×16 pixel tiles.
 
 ### Rendering Pipeline (orchestrated in `Renderer.cpp`)
 
 | Phase | Shader | Purpose |
 |-------|--------|---------|
 | 0: Clear | `clear_depth.comp`, `clear_tiles.comp` | Reset depth buffer (R32UI) to 0xFFFFFFFF and tile counters to 0 |
+| 0.5: Shadow | `clear_shadow.comp`, `shadow_pass.comp` | Render scene depth from the primary light into a 2048×2048 R32UI shadow map |
 | 1: Project & Count | `pass1_count.comp` | Project triangles to screen space, compute AABBs, atomically count triangles per tile |
 | 1.5: Prefix Sum | `pass2_prefix_sum.comp` (3 dispatches) | Blelloch exclusive scan on tile counters; CPU readback of total triangle-tile pairs |
 | 2: Bin | `pass3_bin.comp` | Scatter triangle IDs into per-tile lists using prefix-sum offsets |
-| 3: Rasterize | `pass4_rasterize_tiled.comp` | Per-pixel edge-function tests, barycentric depth/normal/position interpolation, imageAtomicMin depth, Blinn-Phong or PBR shading with multi-light support |
-| 4: Display | ImGui viewport | Sample output texture and present |
+| 3: Rasterize | `pass4_rasterize_tiled.comp` | Per-pixel edge tests, depth/normal/position interpolation, Blinn-Phong or PBR shading, WBOIT accumulation for transparent fragments |
+| 4: OIT Composite | `pass5_oit_composite.comp` | Blend the weighted transparent layer over the opaque output image |
+| 5: Display | ImGui viewport | Sample output texture and present |
+
+### Transparency System (WBOIT)
+
+`pass4` splits each fragment at the `mat.alpha` threshold:
+- `alpha >= 0.99` → **opaque path**: `imageAtomicMin` depth test, winner writes to `outputImage`.
+- `alpha < 0.99` → **transparent path**: WBOIT (McGuire & Bavoil 2013). Each pixel thread accumulates `color × alpha × weight` into thread-local registers and writes to five OIT SSBOs (bindings 9–13) at the end of `main()`. No atomics are needed because each pixel belongs to exactly one tile (one thread owns each pixel).
+
+`pass5` composites: `transColor * (1 - reveal) + opaqueColor * reveal`.
+
+Per-material alpha is exposed in the **Materials** ImGui panel (0 = transparent, 1 = opaque). The default material always has `alpha = 1.0` so existing meshes are unaffected.
 
 ### Lighting System
 
-The rasterizer (`pass4_rasterize_tiled.comp`) supports a full lighting pipeline:
-
-- **Light types:** Directional, Point, Spot (with inner/outer cone falloff)
-- **Shading models:** Blinn-Phong (specular + diffuse) and PBR metallic-roughness (GGX/Smith/Schlick Cook-Torrance), switchable at runtime via UI
-- **Light data** is uploaded as a `GPULight` SSBO at binding 7. `LightManager` rebuilds this buffer each frame from scene entities.
-- If no light entities exist, a default directional light is used as fallback.
-- Uniforms passed to pass4: `numLights`, `cameraPos`, `shadingModel` (0 = Blinn-Phong, 1 = PBR)
+- **Light types:** Directional, Point, Spot (inner/outer cone falloff)
+- **Shading models:** Blinn-Phong and PBR metallic-roughness (GGX/Smith/Schlick), switchable at runtime
+- **Shadow mapping:** One directional light can cast shadows via the R32UI shadow map. `castsShadow` and `lightViewProjection` are baked into `GPULight`.
+- **Light data** is uploaded as a `GPULight` SSBO at binding 7. `LightManager` rebuilds this buffer each frame. If no light entities exist a default directional light is used.
 
 ### Event System
 
-Subsystems communicate via a synchronous publish/subscribe event bus (`EventBus.h/cpp`):
-
-- **WindowResizeEvent** -- viewport resize triggers `Renderer::resize()`
-- **AssetLoadedEvent** -- fired after GPU upload completes (sync and async paths)
-- **ActionEvent** -- published on input state change (rising/falling edge), used for quit action
+Synchronous pub/sub via `EventBus.h/cpp`:
+- `WindowResizeEvent` → `Renderer::resize()`
+- `AssetLoadedEvent` → fired after GPU upload (sync and async paths)
+- `ActionEvent` → published on input rising/falling edge
 
 ### Key Components
 
-- **Application** (`Application.h/cpp`) -- Render loop, ImGui editor UI (Viewport, Scene Hierarchy, Asset Manager, Camera Settings, Lighting panel), scene management, camera controls
-- **Renderer** (`Renderer.h/cpp`) -- Orchestrates the full 5-phase compute pipeline, manages shaders/GPU resources, owns the merged scene mesh and LightManager
-- **LightManager** (`LightManager.h/cpp`) -- Collects light entities, builds `GPULight` SSBO, manages shading model selection
-- **Light** (`Light.h`) -- `Light` struct (CPU), `GPULight` struct (64-byte std430), `LightType`/`ShadingModel` enums, `toGPULight()` converter
-- **Entity** (`Entity.h`) -- Scene entity with transform, optional mesh asset, optional light component (`std::optional<Light>`)
-- **EventBus** (`EventBus.h/cpp`) -- Type-safe synchronous pub/sub using `std::type_index`; global `bus()` singleton
-- **Events** (`Events.h`) -- `WindowResizeEvent`, `AssetLoadedEvent`, `ActionEvent` structs
-- **InputManager** (`InputManager.h/cpp`) -- Named action/axis polling, rebindable GLFW key mappings; publishes `ActionEvent` on state changes
-- **Camera** (`Camera.h/cpp`, `CameraState.h`) -- FPS 6DOF camera with quaternion orientation, orbit mode, bookmarks
-- **COFFParser** (`COFFParser.h/cpp`) -- Loads OFF/COFF mesh files with optional per-face RGB colors; computes smooth per-vertex normals after parsing
-- **GPUBuffer** (`GPUBuffer.h/cpp`) -- Manages Vertex and Face SSBOs
-- **TileRasterizer** (`TileRasterizer.h/cpp`, `TileData.h`) -- Allocates and manages 6 SSBOs for the tiling pipeline, handles prefix sum CPU readback
-- **ComputeShader** (`ComputeShader.h/cpp`) -- Loads/compiles .comp files, dispatches with memory barriers; uniform API: `setInt`, `setUInt`, `setFloat`, `setVec3`, `setIVec2`, `setMat4`
-- **AssetManager** (`AssetManager.h/cpp`) -- Centralized mesh loading, caching, reference counting, async support; publishes `AssetLoadedEvent` on GPU upload completion
-- **Scene** (`Scene.h/cpp`) -- Entity storage, scene bounds calculation
-- **Transform** (`Transform.h`) -- Position/rotation/scale with `getModelMatrix()`
+| Component | Files | Role |
+|-----------|-------|------|
+| Application | `Application.h/cpp` | Render loop, ImGui panels, scene/camera management |
+| Renderer | `Renderer.h/cpp` | Orchestrates the full compute pipeline; owns GPU resources |
+| LightManager | `LightManager.h/cpp` | Builds `GPULight` SSBO, manages shadow VP, shading model |
+| MaterialManager | `MaterialManager.h/cpp` | Owns the `GPUMaterial` SSBO (binding 8); slot 0 is the default |
+| TextureManager | `TextureManager.h/cpp` | Owns the `GL_TEXTURE_2D_ARRAY` sampled in pass4 as `textureAtlas` |
+| TileRasterizer | `TileRasterizer.h/cpp` | Allocates/resizes the 6 tiling pipeline SSBOs; handles prefix-sum CPU readback |
+| COFFParser | `COFFParser.h/cpp` | Loads OFF/COFF files, computes smooth per-vertex normals (area-weighted), generates planar UVs |
+| ComputeShader | `ComputeShader.h/cpp` | Loads `.comp` files; uniform API: `setInt/UInt/Float/Vec3/IVec2/Mat4` |
+| AssetManager | `AssetManager.h/cpp` | Mesh loading, caching, ref-counting, async support |
+| Entity | `Entity.h` | Transform + optional mesh + optional `Light` (`std::optional<Light>`) |
+| Camera | `Camera.h/cpp` | FPS 6DOF (quaternion), orbit mode, bookmarks |
+| EventBus | `EventBus.h/cpp` | Type-safe synchronous pub/sub via `std::type_index`; `bus()` singleton |
 
 ## SSBO Binding Map
 
@@ -104,44 +107,68 @@ Subsystems communicate via a synchronous publish/subscribe event bus (`EventBus.
 | 3 | TriangleListBuffer |
 | 4 | TileWriteOffsetBuffer |
 
-### pass4_rasterize_tiled.comp
-| Binding | Type | Buffer |
-|---------|------|--------|
-| 0 | image2D | outputImage |
-| 1 | uimage2D | depthBuffer |
+### pass4_rasterize_tiled.comp + pass5_oit_composite.comp
+| Binding | Type | Buffer/Image |
+|---------|------|-------------|
+| image unit 0 | `image2D` (RGBA32F) | outputImage — write-only in pass4, read-write in pass5 |
+| image unit 1 | `uimage2D` (R32UI) | depthBuffer (imageAtomicMin) |
+| image unit 2 | `uimage2D` (R32UI) | shadowMap (read-only in pass4) |
 | 2 | SSBO | VertexBuffer |
 | 3 | SSBO | FaceBuffer |
 | 4 | SSBO | ProjectedTriangleBuffer |
 | 5 | SSBO | TileOffsetBuffer |
 | 6 | SSBO | TriangleListBuffer |
-| 7 | SSBO | LightBuffer |
+| 7 | SSBO | LightBuffer (`GPULight[]`) |
+| 8 | SSBO | MaterialBuffer (`GPUMaterial[]`) |
+| 9 | SSBO | OIT oitAccumR — `sum(r × alpha × weight)` |
+| 10 | SSBO | OIT oitAccumG |
+| 11 | SSBO | OIT oitAccumB |
+| 12 | SSBO | OIT oitAccumA — `sum(alpha × weight)` |
+| 13 | SSBO | OIT oitReveal — `product(1 − alpha_i)` |
+
+Image units and SSBO binding points are **separate namespaces**. `GL_MAX_IMAGE_UNITS` caps image units (often 8); SSBO bindings are separate.
+
+## GPU Struct Sizes (std430 — must not change without updating GLSL counterparts)
+
+| Struct | File | Size | Notes |
+|--------|------|------|-------|
+| `Vertex` | `Mesh.h` | 48 bytes | vec3 position + pad, vec3 normal + pad, vec2 uv + 2 pads |
+| `Face` | `Mesh.h` | 32 bytes | uvec3 indices + pad, vec3 color, uint materialID |
+| `GPUMaterial` | `Mesh.h` | 32 bytes | albedo, metallic, roughness, emissive, textureID, **alpha** |
+| `GPULight` | `Light.h` | **128 bytes** | 64 bytes of scalars + mat4 lightViewProjection; `static_assert` enforced |
+| `ProjectedTriangle` | `TileData.h` | 72 bytes | screen verts, NDC depths, AABB, faceIndex, padding[3] |
 
 ## Critical Constraints
 
-- **std430 padding is load-bearing.** C++ structs in `Mesh.h`, `TileData.h`, and `Light.h` (`GPULight`) have explicit padding fields to match GLSL 16-byte alignment. Removing or reordering padding breaks GPU/CPU data communication. `GPULight` is validated with `static_assert(sizeof(GPULight) == 64)`.
-- **SSBO binding points** must stay unique and consistent between C++ code and .comp shader files. Bindings 0-7 are in use in pass4. When adding new SSBOs, use binding 8+.
-- **Normal transform:** `Renderer::submitScene()` transforms normals with `transpose(inverse(mat3(model)))`. Do not use the model matrix directly for normals.
-- **Memory barriers** (`glMemoryBarrier`) are required between every compute pass. Use `GL_SHADER_STORAGE_BARRIER_BIT` and `GL_SHADER_IMAGE_ACCESS_BARRIER_BIT`.
+- **std430 padding is load-bearing.** Explicit padding fields in `Mesh.h`, `TileData.h`, and `Light.h` match GLSL 16-byte alignment. Reordering or removing them silently corrupts GPU data. `GPULight` is guarded by `static_assert(sizeof(GPULight) == 128)`.
+- **SSBO binding points** must stay unique and consistent between C++ and `.comp` files. Bindings 0–13 are now in use. New SSBOs start at binding 14.
+- **Normal transform:** `Renderer::submitScene()` uses `transpose(inverse(mat3(model)))`. Never use the model matrix directly for normals.
+- **Memory barriers** (`glMemoryBarrier`) are required between every compute pass: `GL_SHADER_STORAGE_BARRIER_BIT` between SSBO-producing and SSBO-consuming passes; `GL_SHADER_IMAGE_ACCESS_BARRIER_BIT` before image reads; `GL_TEXTURE_FETCH_BARRIER_BIT` before ImGui samples the output texture.
 - **Coordinate systems:** World space is right-handed. Screen space (0,0) is bottom-left (standard OpenGL).
-- **OpenGL 4.3 Core** is the minimum required version.
+- **OpenGL 4.3 Core** minimum. The shadow map and OIT paths use no extensions beyond what pass4 already required (`GL_ARB_gpu_shader_int64`).
+- **No atomics on OIT SSBOs.** Each pixel is handled by exactly one thread (one workgroup per tile, 16×16 threads per workgroup, non-overlapping tiles). Plain SSBO stores in pass4 are safe.
+
+## Where to Edit
+
+- **Rasterization / shading / transparency:** `pass4_rasterize_tiled.comp` (opaque + WBOIT accumulation)
+- **OIT compositing formula:** `pass5_oit_composite.comp`
+- **Material parameters (CPU side):** `Mesh.h` (`GPUMaterial`), `MaterialManager.cpp` (defaults)
+- **Material UI:** search `ImGui::Begin("Materials")` in `Application.cpp`
+- **Light types and GPU struct:** `Light.h` — must keep `GPULight` at 128 bytes and update GLSL struct to match
+- **Light / shadow management:** `LightManager.cpp`
+- **Camera behavior:** `Camera.cpp`
+- **Key bindings / input actions:** `InputManager.cpp` (`initialize()`)
+- **Mesh loading / normal computation:** `COFFParser.cpp`
+- **Tile size tuning:** `TILE_SIZE` in `TileData.h` — must also update shader `local_size_x/y`
+- **Render pipeline orchestration:** `Renderer.cpp`
+- **Event system:** `EventBus.h` (subscribe/publish), `Events.h` (event structs)
+- **Entity structure:** `Entity.h` (add new optional components here)
 
 ## Adding a New Shader
 
 1. Add `.comp` file to `shaders/`
-2. Instantiate `ComputeShader` in `Renderer.cpp`
-3. Dispatch in the appropriate phase of the render loop in `Renderer::render()`
-4. Shaders auto-copy to build dir on rebuild
-
-## Where to Edit
-
-- Camera behavior: `Camera.cpp`
-- Key bindings / input actions: `InputManager.cpp` (`initialize()`)
-- Rasterization logic / shading / lighting: `pass4_rasterize_tiled.comp`
-- Light types and GPU struct: `Light.h` (must keep `GPULight` at 64 bytes and update GLSL struct to match)
-- Light buffer management: `LightManager.cpp`
-- UI/editor features: search for `ImGui::Begin` in `Application.cpp`
-- Mesh loading / normal computation: `COFFParser.cpp`
-- Tile size tuning: `TILE_SIZE` in `TileData.h` (must also update shader workgroup sizes)
-- Render pipeline orchestration: `Renderer.cpp`
-- Event system: `EventBus.h` (subscribe/publish), `Events.h` (event structs)
-- Entity structure: `Entity.h` (add new optional components here)
+2. Add `std::unique_ptr<ComputeShader>` member to `Renderer.h`
+3. Load it in `Renderer::initialize()` and add to the validity check
+4. Bind SSBOs/images and dispatch in `Renderer::render()` at the correct phase
+5. Release in `Renderer::shutdown()`
+6. Shaders are auto-copied to the build output directory on rebuild

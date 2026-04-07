@@ -72,6 +72,36 @@ GLuint Renderer::createShadowMap(int size) {
 }
 
 // ============================================
+// OIT BUFFER HELPER
+// ============================================
+
+// Allocate (or reallocate) the five OIT accumulation SSBOs.
+// Each buffer holds one uint32 per screen pixel, storing a packed float.
+// GL_DYNAMIC_DRAW is used because these buffers are re-allocated on every resize.
+// Called from initialize() on startup and from resize() whenever the viewport changes.
+void Renderer::createOITBuffers(int width, int height) {
+    // Each pixel needs one uint32 (4 bytes) per OIT channel.
+    GLsizeiptr bufferSize = static_cast<GLsizeiptr>(width) * height * sizeof(uint32_t);
+
+    // Helper lambda: create on first call, then re-allocate storage each time.
+    auto allocBuf = [&](GLuint& buf) {
+        if (buf == 0)
+            glGenBuffers(1, &buf);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
+        // nullptr data — pass4 writes every pixel unconditionally each frame, so
+        // we don't need to initialize the contents here.
+        glBufferData(GL_SHADER_STORAGE_BUFFER, bufferSize, nullptr, GL_DYNAMIC_DRAW);
+    };
+
+    allocBuf(m_oitAccumR);  // sum(r * alpha * weight) per pixel
+    allocBuf(m_oitAccumG);  // sum(g * alpha * weight) per pixel
+    allocBuf(m_oitAccumB);  // sum(b * alpha * weight) per pixel
+    allocBuf(m_oitAccumA);  // sum(alpha * weight) per pixel
+    allocBuf(m_oitReveal);  // product(1 - alpha_i) per pixel (transmittance)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+}
+
+// ============================================
 // INITIALIZE
 // ============================================
 
@@ -90,15 +120,17 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
     m_pass2Shader      = std::make_unique<ComputeShader>("shaders/pass2_prefix_sum.comp");
     m_pass3Shader      = std::make_unique<ComputeShader>("shaders/pass3_bin.comp");
     m_pass4Shader      = std::make_unique<ComputeShader>("shaders/pass4_rasterize_tiled.comp");
+    // OIT composite pass: blend transparent fragments over the opaque output image.
+    m_pass5OITShader   = std::make_unique<ComputeShader>("shaders/pass5_oit_composite.comp");
     m_debugTilesShader = std::make_unique<ComputeShader>("shaders/debug_tiles.comp");
     // Shadow mapping shaders.
     m_clearShadowShader = std::make_unique<ComputeShader>("shaders/clear_shadow.comp");
     m_shadowPassShader  = std::make_unique<ComputeShader>("shaders/shadow_pass.comp");
 
-    if (!m_clearDepthShader->isValid() || !m_clearTilesShader->isValid() ||
-        !m_pass1Shader->isValid()      || !m_pass2Shader->isValid()      ||
-        !m_pass3Shader->isValid()      || !m_pass4Shader->isValid()      ||
-        !m_debugTilesShader->isValid() ||
+    if (!m_clearDepthShader->isValid()  || !m_clearTilesShader->isValid()  ||
+        !m_pass1Shader->isValid()       || !m_pass2Shader->isValid()       ||
+        !m_pass3Shader->isValid()       || !m_pass4Shader->isValid()       ||
+        !m_pass5OITShader->isValid()    || !m_debugTilesShader->isValid()  ||
         !m_clearShadowShader->isValid() || !m_shadowPassShader->isValid()) {
         std::cerr << "[ERROR] Renderer: one or more compute shaders failed to compile" << std::endl;
         return false;
@@ -115,6 +147,10 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
 
     m_tileRasterizer = std::make_unique<TileRasterizer>(viewportWidth, viewportHeight);
     m_tileRasterizer->initialize(1); // Placeholder — resized on first mesh load
+
+    // Allocate OIT accumulation SSBOs at initial viewport size.
+    // These are written unconditionally by pass4 every frame, so no initial data is needed.
+    createOITBuffers(viewportWidth, viewportHeight);
 
     // Upload the default material (slot 0) to the GPU.
     // All faces parsed from COFF files are assigned materialID=0, so existing meshes
@@ -140,6 +176,11 @@ void Renderer::shutdown() {
     glDeleteTextures(1, &m_depthBuffer);      m_depthBuffer      = 0;
     glDeleteTextures(1, &m_shadowMapTexture); m_shadowMapTexture = 0;
 
+    // Release OIT accumulation SSBOs
+    GLuint oitBufs[] = { m_oitAccumR, m_oitAccumG, m_oitAccumB, m_oitAccumA, m_oitReveal };
+    glDeleteBuffers(5, oitBufs);
+    m_oitAccumR = m_oitAccumG = m_oitAccumB = m_oitAccumA = m_oitReveal = 0;
+
     m_lightManager.shutdown();
     m_materialManager.shutdown();
     m_textureManager.shutdown();
@@ -150,6 +191,7 @@ void Renderer::shutdown() {
     m_pass2Shader.reset();
     m_pass3Shader.reset();
     m_pass4Shader.reset();
+    m_pass5OITShader.reset();
     m_debugTilesShader.reset();
     m_clearShadowShader.reset();
     m_shadowPassShader.reset();
@@ -170,6 +212,8 @@ void Renderer::resize(int newWidth, int newHeight) {
     m_viewportHeight = newHeight;
     m_outputTexture  = createOutputTexture(newWidth, newHeight);
     m_depthBuffer    = createDepthBuffer(newWidth, newHeight);
+    // OIT buffers are per-pixel so they must match the new viewport dimensions exactly.
+    createOITBuffers(newWidth, newHeight);
     if (!m_mergedMesh.faces.empty())
         m_tileRasterizer->resize(newWidth, newHeight, m_mergedMesh.getFaceCount());
 }
@@ -447,6 +491,15 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
         m_lightManager.bind(7);
         m_materialManager.bind(8);  // binding 8: GPUMaterial array
 
+        // OIT accumulation SSBOs (bindings 9-13).
+        // pass4 writes thread-local WBOIT data for every in-bounds pixel at the end of main().
+        // No explicit clear is needed — each pixel thread initializes its own local accumulators.
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9,  m_oitAccumR);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, m_oitAccumG);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 11, m_oitAccumB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 12, m_oitAccumA);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 13, m_oitReveal);
+
         // Bind the texture array to unit 0 and point the sampler uniform at it.
         m_textureManager.bind(0);
         m_pass4Shader->setInt("textureAtlas", 0);
@@ -469,6 +522,25 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
         m_pass4Shader->setInt  ("shadowLightIndex", m_lightManager.getShadowLightIndex());
 
         m_pass4Shader->dispatch(numGroupsX, numGroupsY, 1);
+
+        // Ensure all pass4 SSBO writes (OIT accumulators) and image writes (depth + output)
+        // are visible before pass5 reads them.
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+        // --- Phase 4: OIT Composite (pass5_oit_composite.comp) ---
+        // For every pixel, read the accumulated transparent fragment data from the OIT SSBOs
+        // and blend it over the opaque color already in the output image.
+        // Only pixels with actual transparent coverage (oitAccumA > 0) are modified.
+        m_pass5OITShader->use();
+        // outputImage at image unit 0 — needs both read (opaque color) and write (final composite)
+        glBindImageTexture(0, m_outputTexture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9,  m_oitAccumR);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, m_oitAccumG);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 11, m_oitAccumB);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 12, m_oitAccumA);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 13, m_oitReveal);
+        m_pass5OITShader->setIVec2("screenSize", glm::ivec2(m_viewportWidth, m_viewportHeight));
+        m_pass5OITShader->dispatch(numGroupsX, numGroupsY, 1);
     } else {
         // No visible geometry — fill with a dark background color via CPU upload.
         // This avoids leaving stale content in the output texture from a previous frame.

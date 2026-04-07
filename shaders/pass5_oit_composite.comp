@@ -1,0 +1,87 @@
+#version 430 core
+
+// pass5_oit_composite.comp — Phase 4: Composite transparent fragments over the opaque image.
+//
+// This pass is the second half of Weighted Blended Order-Independent Transparency (WBOIT)
+// as described in McGuire & Bavoil 2013 "Weighted Blended Order-Independent Transparency".
+//
+// pass4_rasterize_tiled.comp writes per-pixel OIT accumulation data into five SSBOs
+// (bindings 9–13). This pass reads those SSBOs and blends the transparent layer over
+// the opaque output image that pass4 already wrote.
+//
+// Compositing formula:
+//   transColor = accum.rgb / accum.a             — weighted average of transparent colors
+//   coverage   = 1.0 - reveal                   — fraction of pixel occluded by transparents
+//   result     = transColor * coverage + opaqueColor * reveal
+//
+// where:
+//   accum.rgb = sum(color_i * alpha_i * weight_i)   (premultiplied weighted color)
+//   accum.a   = sum(alpha_i * weight_i)              (normalisation denominator)
+//   reveal    = product(1 - alpha_i)                 (accumulated transmittance)
+//
+// If no transparent fragments cover a pixel (accum.a ≈ 0), the opaque color is left
+// unchanged, making this pass free for fully-opaque scenes.
+//
+// The weight function in pass4 ensures near, high-alpha fragments dominate, producing
+// correct-looking transparency without requiring per-pixel depth sorting.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Output color image — READ the opaque background, then WRITE the composited result.
+// Access mode must be READ_WRITE so imageLoad + imageStore are both valid.
+// This is the same texture that pass4 wrote the opaque geometry into.
+layout(rgba32f, binding = 0) uniform image2D outputImage;
+
+// OIT accumulation SSBOs written by pass4.
+// Each entry is a float packed as uint via floatBitsToUint / uintBitsToFloat.
+// Pixel index:  idx = pixelCoords.y * screenSize.x + pixelCoords.x
+layout(std430, binding = 9)  readonly buffer OITAccumR { uint oitAccumR[]; };
+layout(std430, binding = 10) readonly buffer OITAccumG { uint oitAccumG[]; };
+layout(std430, binding = 11) readonly buffer OITAccumB { uint oitAccumB[]; };
+layout(std430, binding = 12) readonly buffer OITAccumA { uint oitAccumA[]; };
+layout(std430, binding = 13) readonly buffer OITReveal  { uint oitReveal[];  };
+
+// Viewport dimensions — needed to compute pixel indices and guard edge threads.
+uniform ivec2 screenSize;
+
+void main() {
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+
+    // Guard: edge workgroups may extend past the viewport boundary.
+    if (pixelCoords.x >= screenSize.x || pixelCoords.y >= screenSize.y)
+        return;
+
+    // Flat pixel index matching the layout used in pass4 (row-major, same screenSize).
+    int pixelIdx = pixelCoords.y * screenSize.x + pixelCoords.x;
+
+    // Unpack OIT accumulation data from the per-pixel SSBOs.
+    // uintBitsToFloat restores the exact IEEE 754 float that pass4 stored with floatBitsToUint.
+    float accumR = uintBitsToFloat(oitAccumR[pixelIdx]);
+    float accumG = uintBitsToFloat(oitAccumG[pixelIdx]);
+    float accumB = uintBitsToFloat(oitAccumB[pixelIdx]);
+    float accumA = uintBitsToFloat(oitAccumA[pixelIdx]);  // normalisation weight
+    float reveal = uintBitsToFloat(oitReveal[pixelIdx]);  // product of (1 - alpha_i)
+
+    // Fast exit: if the weighted alpha sum is negligible, no transparent fragments
+    // covered this pixel — skip the blend to leave the opaque color untouched.
+    if (accumA < 1e-5)
+        return;
+
+    // ── WBOIT Composite ────────────────────────────────────────────────────────────
+    // transColor: divide out the weight denominator to recover the weighted-average
+    //             color of all transparent fragments at this pixel.
+    // coverage:   how much of the pixel is "occluded" by transparent geometry.
+    //             reveal == 1.0 → nothing transparent here (covered by early-exit above).
+    //             reveal == 0.0 → fully covered, opaque surface invisible.
+    //
+    // The blend formula is: result = transColor * coverage + opaqueColor * reveal
+    // which is Porter-Duff "over" with the transparent layer in front.
+    vec4  opaqueColor = imageLoad(outputImage, pixelCoords);
+    vec3  transColor  = vec3(accumR, accumG, accumB) / max(accumA, 1e-5);
+    float coverage    = 1.0 - reveal;
+    vec3  finalColor  = transColor * coverage + opaqueColor.rgb * reveal;
+
+    // Write composited result; alpha stays 1.0 (the final image is always opaque
+    // from ImGui's perspective — blending against the window background is not needed).
+    imageStore(outputImage, pixelCoords, vec4(finalColor, 1.0));
+}
