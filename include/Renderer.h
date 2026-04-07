@@ -10,6 +10,7 @@
 #include "LightManager.h"
 #include "MaterialManager.h"
 #include "Mesh.h"
+#include "TextureManager.h"
 #include "Scene.h"
 #include "TileRasterizer.h"
 
@@ -48,10 +49,13 @@ public:
 
     LightManager&    getLightManager()    { return m_lightManager;    }
     MaterialManager& getMaterialManager() { return m_materialManager; }
+    TextureManager&  getTextureManager()  { return m_textureManager;  }
 
 private:
     GLuint createOutputTexture(int width, int height);
     GLuint createDepthBuffer(int width, int height);
+    // Create the R32UI shadow map texture used by the shadow pass and sampled in pass4.
+    GLuint createShadowMap(int size);
 
     // Compute shaders
     std::unique_ptr<ComputeShader> m_clearDepthShader;
@@ -61,12 +65,20 @@ private:
     std::unique_ptr<ComputeShader> m_pass3Shader;
     std::unique_ptr<ComputeShader> m_pass4Shader;
     std::unique_ptr<ComputeShader> m_debugTilesShader;
+    // Shadow mapping shaders — clear the shadow map then rasterise scene depth from the light.
+    std::unique_ptr<ComputeShader> m_clearShadowShader;
+    std::unique_ptr<ComputeShader> m_shadowPassShader;
 
     // Viewport render targets
     GLuint m_outputTexture  = 0;
     GLuint m_depthBuffer    = 0;
     int    m_viewportWidth  = 256;
     int    m_viewportHeight = 256;
+
+    // Shadow map (R32UI, fixed-resolution, independent of viewport size).
+    // 2048×2048 gives reasonable quality without huge memory cost (~16 MB).
+    GLuint m_shadowMapTexture = 0;
+    int    m_shadowMapSize    = 2048;
 
     // Tile pipeline
     std::unique_ptr<TileRasterizer> m_tileRasterizer;
@@ -77,6 +89,7 @@ private:
 
     LightManager    m_lightManager;
     MaterialManager m_materialManager;
+    TextureManager  m_textureManager;
 
     bool m_sceneDirty = true;   // safety net: auto-submit on first render if missed
     bool m_debugMode  = false;

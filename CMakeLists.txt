@@ -73,6 +73,19 @@ set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nfd)
 
 # ---------------------------------------------------------
+# stb — single-header image loading (stb_image.h) and resizing (stb_image_resize2.h)
+# ---------------------------------------------------------
+FetchContent_Declare(
+    stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        master
+)
+FetchContent_GetProperties(stb)
+if(NOT stb_POPULATED)
+    FetchContent_Populate(stb)
+endif()
+
+# ---------------------------------------------------------
 # Project Targets
 # ---------------------------------------------------------
 
@@ -96,10 +109,12 @@ add_executable(Engine
     src/EventBus.cpp
     src/LightManager.cpp
     src/MaterialManager.cpp
+    src/TextureManager.cpp
 )
 
 # Include directories for the Engine
 target_include_directories(Engine PRIVATE include)
+target_include_directories(Engine PRIVATE ${stb_SOURCE_DIR})
 
 # Link the libraries to your Engine
 target_link_libraries(Engine PRIVATE

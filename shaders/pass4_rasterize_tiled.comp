@@ -37,9 +37,15 @@ layout(rgba32f, binding = 0) uniform image2D outputImage;
 layout(r32ui, binding = 1) coherent uniform uimage2D depthBuffer;
 
 // Vertex: world-space position (after model matrix) and smooth normal (after normal matrix)
+// Vertex: world-space position, smooth normal, and UV coordinates (48 bytes in std430).
+// vec3 fields each consume a 16-byte slot; vec2 uv sits at byte 32; two float pads bring
+// the struct to 48 bytes. Must match C++ Vertex in Mesh.h.
 struct Vertex {
-    vec3 position;
-    vec3 normal;
+    vec3  position;   // bytes  0–11 (+4 implicit pad)
+    vec3  normal;     // bytes 16–27 (+4 implicit pad)
+    vec2  uv;         // bytes 32–39: texture coordinates (planar XY projection)
+    float _p0;        // bytes 40–43: explicit pad
+    float _p1;        // bytes 44–47: explicit pad
 };
 
 // Face: vertex indices into the merged vertex buffer + per-face color + material slot
@@ -66,23 +72,27 @@ struct ProjectedTriangle {
     uint padding[3];
 };
 
-// GPULight: 64-byte std430 struct (see Light.h for byte-offset layout)
+// GPULight: 128-byte std430 struct (see Light.h for byte-offset layout).
 // Each vec3 is followed by a float packing to satisfy std430 16-byte alignment.
+// Layout grew from 64→128 bytes when shadow mapping was added — must match the
+// C++ GPULight struct field-for-field, including the trailing mat4.
 struct GPULight {
-    vec3  position;    float type;       // type: 0=Directional, 1=Point, 2=Spot (stored as float)
+    vec3  position;    float type;          // type: 0=Directional, 1=Point, 2=Spot (stored as float)
     vec3  direction;   float intensity;
     vec3  color;       float range;
-    float innerCos;    float outerCos;   // Pre-computed cos(innerCone/outerCone) to avoid trig in shader
-    float _pad0;       float _pad1;
+    float innerCos;    float outerCos;      // Pre-computed cos(innerCone/outerCone)
+    float castsShadow; float _pad0;         // 1.0 if this light casts shadows, 0.0 otherwise
+    mat4  lightViewProjection;              // World→light-clip matrix for shadow lookups
 };
 
 // GPUMaterial — 32-byte std430 struct. See GPUMaterial in Mesh.h for byte-offset layout.
 // Slot 0 is the default white/neutral material (albedo=1,1,1; metallic=0; roughness=0.5; emissive=0).
 // final_albedo = face.color × mat.albedo → default preserves original face color.
+// textureID: -1 = no texture (face.color × albedo only); 0+ = layer index in textureAtlas.
 struct GPUMaterial {
     vec3  albedo;     float metallic;    // bytes  0–15
     float roughness;  float emissive;    // bytes 16–23
-    float _p0;        float _p1;         // bytes 24–31 (padding)
+    int   textureID;  float _p1;         // bytes 24–31 (textureID replaces former _p0)
 };
 
 // SSBO binding layout (must match Renderer.cpp pass4 setup):
@@ -101,12 +111,27 @@ layout(std430, binding = 6) buffer TriangleListBuffer      { uint triangleList[]
 layout(std430, binding = 7) buffer LightBuffer             { GPULight lights[]; };
 layout(std430, binding = 8) buffer MaterialBuffer          { GPUMaterial materials[]; };
 
+// Shadow map (R32UI) bound at image unit 9. Read with imageLoad and bit-cast back to float.
+// Written by shadow_pass.comp using floatBitsToUint(depth) + imageAtomicMin.
+// Image binding 2 (image units are a separate namespace from SSBO bindings, and the
+// hardware limit is often 8 — bindings 0/1 hold the output and depth images).
+layout(r32ui, binding = 2) readonly uniform uimage2D shadowMap;
+
 uniform ivec2 screenSize;
 uniform ivec2 numTiles;
 uniform int   numLights;
 uniform int   numMaterials;
 uniform vec3  cameraPos;
 uniform int   shadingModel; // 0 = Blinn-Phong, 1 = PBR
+
+// Shadow mapping uniforms — set by Renderer::render() for the primary shadow-casting light.
+uniform mat4  shadowViewProjection; // Same matrix used by shadow_pass.comp
+uniform ivec2 shadowMapSize;        // Resolution of the shadow map texture
+uniform int   shadowLightIndex;     // Index in lights[] of the light that owns shadowMap (-1 = none)
+
+// Texture array holding all loaded textures as layers (GL_TEXTURE_2D_ARRAY, unit 0).
+// Indexed with vec3(u, v, layerIndex); only sampled when GPUMaterial::textureID >= 0.
+uniform sampler2DArray textureAtlas;
 
 // -----------------------------------------------
 // Utility
@@ -156,6 +181,52 @@ bool pointInTriangle(vec2 pt, vec2 v0, vec2 v1, vec2 v2, out vec3 barycentric) {
 uint encodeDepth(float depth) {
     float nd = clamp((depth + 1.0) * 0.5, 0.0, 1.0);
     return uint(nd * 4294967295.0);
+}
+
+// -----------------------------------------------
+// Shadow mapping
+// -----------------------------------------------
+
+// Sample the shadow map for a given world-space surface point and return a
+// shadow factor in [0, 1]:
+//   1.0 = fully lit (no occluder between this point and the light)
+//   0.0 = fully in shadow
+//
+// The depth was stored by shadow_pass.comp as floatBitsToUint(depth01), where
+// depth01 = (NDC_z + 1) * 0.5. We undo that here with uintBitsToFloat() and a
+// matching NDC remap on the current pixel's light-space position.
+//
+// `N` and `L` are passed in so we can apply a slope-scaled bias: surfaces nearly
+// parallel to the light direction need a larger bias to avoid self-shadowing
+// "shadow acne" stripes from precision error in depth comparison.
+float computeShadowFactor(vec3 worldPos, vec3 N, vec3 L) {
+    // Project this surface point into the shadow map's clip space.
+    vec4 lp = shadowViewProjection * vec4(worldPos, 1.0);
+    if (lp.w <= 0.0001) return 1.0; // Behind the light — treat as lit (caller already checked NdotL)
+
+    vec3 ndc = lp.xyz / lp.w;
+    // Outside the light frustum → no shadow info available, fall back to lit.
+    if (any(lessThan(ndc.xyz, vec3(-1.0))) || any(greaterThan(ndc.xyz, vec3(1.0))))
+        return 1.0;
+
+    // Map NDC xy ∈ [-1,1] to integer texel coordinates.
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    ivec2 texel = ivec2(uv * vec2(shadowMapSize));
+    texel = clamp(texel, ivec2(0), shadowMapSize - ivec2(1));
+
+    // Decode the stored closest-occluder depth.
+    uint  storedBits  = imageLoad(shadowMap, texel).r;
+    float storedDepth = uintBitsToFloat(storedBits);
+
+    // Convert this pixel's NDC depth to the same [0,1] encoding shadow_pass uses.
+    float currentDepth = clamp((ndc.z + 1.0) * 0.5, 0.0, 1.0);
+
+    // Slope-scaled bias: more bias when the light grazes the surface.
+    // 0.0005 is the constant floor to fight precision error on flat-on surfaces.
+    float bias = max(0.005 * (1.0 - dot(N, L)), 0.0005);
+
+    // Standard binary depth compare. Could be expanded to a 3×3 PCF kernel later.
+    return (currentDepth - bias > storedDepth) ? 0.0 : 1.0;
 }
 
 // -----------------------------------------------
@@ -261,7 +332,14 @@ vec3 shadeBlinnPhong(vec3 albedo, vec3 N, vec3 V, vec3 worldPos) {
         vec3 H = normalize(L + V); // Blinn's half-vector: bisector of L and V
         float spec = pow(max(dot(N, H), 0.0), 64.0); // Specular highlight (shininess = 64)
 
-        result += lights[i].color * lights[i].intensity * atten
+        // Shadow modulation: only the designated shadow-casting light is occluded.
+        // Ambient (the 0.03*albedo above) is intentionally left unmultiplied so shadows
+        // are dark grey rather than pitch black.
+        float shadow = 1.0;
+        if (i == shadowLightIndex && lights[i].castsShadow > 0.5)
+            shadow = computeShadowFactor(worldPos, N, L);
+
+        result += lights[i].color * lights[i].intensity * atten * shadow
                 * (albedo * NdotL + vec3(0.3) * spec); // Diffuse + specular contribution
     }
     return result;
@@ -304,7 +382,12 @@ vec3 shadePBR(vec3 albedo, vec3 N, vec3 V, vec3 worldPos, float metallic, float 
         // kD = 0 for metals (all energy goes into specular)
         vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
 
-        vec3 radiance = lights[i].color * lights[i].intensity * atten;
+        // Shadow modulation — same rule as Blinn-Phong: only the assigned shadow caster.
+        float shadow = 1.0;
+        if (i == shadowLightIndex && lights[i].castsShadow > 0.5)
+            shadow = computeShadowFactor(worldPos, N, L);
+
+        vec3 radiance = lights[i].color * lights[i].intensity * atten * shadow;
         result += (kD * albedo / PI + specular) * radiance * NdotL;
     }
     return result;
@@ -375,6 +458,11 @@ void main() {
                           + barycentric.y * vertices[idx.y].position
                           + barycentric.z * vertices[idx.z].position;
 
+            // Interpolate per-vertex UV (planar projection — barycentric is acceptable)
+            vec2 uv = barycentric.x * vertices[idx.x].uv
+                    + barycentric.y * vertices[idx.y].uv
+                    + barycentric.z * vertices[idx.z].uv;
+
             // View direction: unit vector from surface point toward the camera
             vec3 V = normalize(cameraPos - worldPos);
 
@@ -382,8 +470,15 @@ void main() {
             // fall back to slot 0 (default white material) rather than reading garbage memory
             GPUMaterial mat = materials[clamp(int(face.materialID), 0, numMaterials - 1)];
 
-            // Blend face tint with material albedo — default albedo (1,1,1) preserves face color
-            vec3 albedo = face.color * mat.albedo;
+            // Blend face tint, material albedo, and optional texture sample.
+            // textureID == -1 preserves pre-texture behavior exactly.
+            vec3 albedo;
+            if (mat.textureID >= 0) {
+                vec4 texSample = texture(textureAtlas, vec3(uv, float(mat.textureID)));
+                albedo = face.color * mat.albedo * texSample.rgb;
+            } else {
+                albedo = face.color * mat.albedo;
+            }
 
             // Dispatch to the selected shading model
             vec3 color;

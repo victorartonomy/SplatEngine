@@ -10,7 +10,7 @@ MaterialManager::MaterialManager() {
     def.metallic  = 0.0f;             // Dielectric by default
     def.roughness = 0.5f;             // Mid-range roughness matches the old hardcoded value
     def.emissive  = 0.0f;
-    def._pad0     = 0.0f;
+    def.textureID = -1;               // No texture — preserves face.color × albedo behavior
     def._pad1     = 0.0f;
     m_materials.push_back(def);
 }

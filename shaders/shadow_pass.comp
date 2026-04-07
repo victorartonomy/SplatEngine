@@ -1,0 +1,147 @@
+#version 430 core
+
+// shadow_pass.comp — Depth-from-light pre-pass for shadow mapping.
+//
+// One thread per triangle. The thread:
+//   1. Reads the 3 world-space vertex positions of its triangle.
+//   2. Transforms them with the supplied lightViewProjection matrix (built on
+//      the CPU as ortho * lookAt for a directional light — see Light.h).
+//   3. Performs the perspective divide and converts NDC to shadow-map texel coords.
+//   4. Computes a screen-space AABB and runs an edge-function rasteriser over it,
+//      writing the *closest* light-space depth to each covered texel via atomicMin.
+//
+// Output format trick:
+//   The shadow map is an R32UI image (not R32F) because GLSL only exposes
+//   imageAtomicMin on integer images. We bit-cast the float depth to a uint with
+//   floatBitsToUint(). For non-negative IEEE-754 floats this is monotonic — the
+//   ordering of the uint values matches the ordering of the original floats — so
+//   atomicMin on the uints behaves correctly as atomicMin on the depths.
+//
+// Bias and PCF live in pass4_rasterize_tiled.comp; this shader only writes raw depth.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Vertex layout — must match Mesh.h / Vertex in pass1_count.comp (48 bytes std430).
+struct Vertex {
+    vec3  position;
+    vec3  normal;
+    vec2  uv;
+    float _p0;
+    float _p1;
+};
+
+// Face layout — must match Mesh.h / Face in pass1_count.comp.
+struct Face {
+    uvec3 indices;
+    vec3  color;
+    uint  materialID;
+};
+
+// SSBO bindings — must match the dispatch site in Renderer.cpp.
+layout(std430, binding = 0) buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 1) buffer FaceBuffer   { Face   faces[];    };
+
+// Shadow map: R32UI so we can use imageAtomicMin (no atomic float images in GL).
+// `coherent` keeps writes from different invocations visible to each other within the dispatch.
+layout(r32ui, binding = 2) coherent uniform uimage2D shadowMap;
+
+// Uniforms set by Renderer::render() before this dispatch.
+uniform mat4  lightViewProjection; // CPU-built ortho × lookAt for the shadow-casting light
+uniform ivec2 shadowMapSize;       // Width/height of the shadow map texture
+
+// Same 2D signed-area helper as pass4 — used as edge function for the point-in-triangle test.
+float sign2D(vec2 p1, vec2 p2, vec2 p3) {
+    return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+}
+
+void main() {
+    uint triangleID = gl_GlobalInvocationID.x;
+    if (triangleID >= faces.length()) return;
+
+    Face face = faces[triangleID];
+    vec3 w0 = vertices[face.indices.x].position;
+    vec3 w1 = vertices[face.indices.y].position;
+    vec3 w2 = vertices[face.indices.z].position;
+
+    // ---- Transform into light clip space ----
+    vec4 c0 = lightViewProjection * vec4(w0, 1.0);
+    vec4 c1 = lightViewProjection * vec4(w1, 1.0);
+    vec4 c2 = lightViewProjection * vec4(w2, 1.0);
+
+    // For an orthographic projection w == 1 always, but guarding against w<=0 keeps
+    // this shader correct if a perspective light VP is plugged in later.
+    if (c0.w <= 0.0001 || c1.w <= 0.0001 || c2.w <= 0.0001) return;
+
+    vec3 n0 = c0.xyz / c0.w;
+    vec3 n1 = c1.xyz / c1.w;
+    vec3 n2 = c2.xyz / c2.w;
+
+    // ---- Frustum cull (cheap reject when entire triangle is outside the unit cube) ----
+    if ((n0.x < -1.0 && n1.x < -1.0 && n2.x < -1.0) ||
+        (n0.x >  1.0 && n1.x >  1.0 && n2.x >  1.0) ||
+        (n0.y < -1.0 && n1.y < -1.0 && n2.y < -1.0) ||
+        (n0.y >  1.0 && n1.y >  1.0 && n2.y >  1.0) ||
+        (n0.z < -1.0 && n1.z < -1.0 && n2.z < -1.0) ||
+        (n0.z >  1.0 && n1.z >  1.0 && n2.z >  1.0)) {
+        return;
+    }
+
+    // ---- NDC -> shadow map texel coordinates ----
+    vec2 sm = vec2(shadowMapSize);
+    vec2 v0 = vec2((n0.x * 0.5 + 0.5) * sm.x, (n0.y * 0.5 + 0.5) * sm.y);
+    vec2 v1 = vec2((n1.x * 0.5 + 0.5) * sm.x, (n1.y * 0.5 + 0.5) * sm.y);
+    vec2 v2 = vec2((n2.x * 0.5 + 0.5) * sm.x, (n2.y * 0.5 + 0.5) * sm.y);
+
+    // Per-vertex depth in [0,1]. We map NDC z (-1..1) to [0..1] so the bit pattern is
+    // a non-negative float — required for the floatBitsToUint atomicMin trick.
+    float d0 = clamp((n0.z + 1.0) * 0.5, 0.0, 1.0);
+    float d1 = clamp((n1.z + 1.0) * 0.5, 0.0, 1.0);
+    float d2 = clamp((n2.z + 1.0) * 0.5, 0.0, 1.0);
+
+    // ---- Screen-space AABB clamped to shadow map bounds ----
+    vec2 minF = min(min(v0, v1), v2);
+    vec2 maxF = max(max(v0, v1), v2);
+    ivec2 aabbMin = clamp(ivec2(floor(minF)), ivec2(0), shadowMapSize - ivec2(1));
+    ivec2 aabbMax = clamp(ivec2(ceil (maxF)), ivec2(0), shadowMapSize - ivec2(1));
+
+    // TDR guard: skip giant triangles that would loop over millions of texels.
+    ivec2 sz = aabbMax - aabbMin + ivec2(1);
+    if (sz.x <= 0 || sz.y <= 0) return;
+    if (sz.x * sz.y > 65536) return; // Cap at 256×256 texels per triangle
+
+    // Pre-compute the inverse total area for barycentric normalisation. If it's near
+    // zero the triangle is degenerate (edge-on or collapsed) and contributes nothing.
+    float totalArea = sign2D(v0, v1, v2);
+    if (abs(totalArea) < 0.0001) return;
+    float invArea = 1.0 / totalArea;
+
+    // ---- Rasterise: for every texel in the AABB run a half-plane test, interpolate
+    //      depth, and atomic-min into the shadow map.
+    for (int y = aabbMin.y; y <= aabbMax.y; ++y) {
+        for (int x = aabbMin.x; x <= aabbMax.x; ++x) {
+            // Sample at the texel center for sub-texel accuracy.
+            vec2 p = vec2(float(x) + 0.5, float(y) + 0.5);
+
+            // Edge functions = signed sub-areas opposite each vertex.
+            float w0e = sign2D(p, v1, v2);
+            float w1e = sign2D(p, v2, v0);
+            float w2e = sign2D(p, v0, v1);
+
+            // Inside test: all edge functions share the same sign as totalArea.
+            // Multiplying by invArea normalises while preserving sign info.
+            float b0 = w0e * invArea;
+            float b1 = w1e * invArea;
+            float b2 = w2e * invArea;
+            if (b0 < 0.0 || b1 < 0.0 || b2 < 0.0) continue;
+
+            // Barycentric depth interpolation.
+            float depth = b0 * d0 + b1 * d1 + b2 * d2;
+
+            // Bit-cast to uint for atomicMin. Both floats are non-negative so the
+            // monotonic IEEE-754 representation makes uint comparison equivalent to
+            // float comparison — closer surfaces produce smaller uints and win.
+            uint depthBits = floatBitsToUint(depth);
+            imageAtomicMin(shadowMap, ivec2(x, y), depthBits);
+        }
+    }
+}

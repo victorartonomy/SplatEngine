@@ -94,6 +94,24 @@ bool COFFParser::loadFromFile(const std::string& filePath, Mesh& outMesh) {
         else             v.normal = glm::vec3(0.0f, 1.0f, 0.0f); // Degenerate vertex fallback
     }
 
+    // === PLANAR UV GENERATION ===
+    // Assign texture coordinates by normalizing world-space XY position within the mesh's
+    // bounding box. Gives any COFF mesh meaningful UVs without format changes.
+    // Degenerate axes (flat in X or Y) clamp to 0 rather than producing NaN.
+    {
+        glm::vec3 bMin( 1e30f), bMax(-1e30f);
+        for (const auto& v : outMesh.vertices) {
+            bMin = glm::min(bMin, v.position);
+            bMax = glm::max(bMax, v.position);
+        }
+        glm::vec3 bRange = bMax - bMin;
+
+        for (auto& v : outMesh.vertices) {
+            v.uv.x = (bRange.x > 1e-6f) ? (v.position.x - bMin.x) / bRange.x : 0.0f;
+            v.uv.y = (bRange.y > 1e-6f) ? (v.position.y - bMin.y) / bRange.y : 0.0f;
+        }
+    }
+
     auto endTime = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
@@ -159,6 +177,9 @@ bool COFFParser::parseVertices(std::ifstream& file, size_t vertexCount, std::vec
         vertex._pad0   = 0.0f;
         vertex.normal  = glm::vec3(0.0f);
         vertex._pad1   = 0.0f;
+        vertex.uv      = glm::vec2(0.0f); // Filled in by planar UV pass after face parsing
+        vertex._pad2   = 0.0f;
+        vertex._pad3   = 0.0f;
         vertices.push_back(vertex);
 
         if (i % 500000 == 0 && i > 0) {

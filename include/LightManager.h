@@ -3,6 +3,7 @@
 
 #include <glad/glad.h>
 #include <vector>
+#include <glm/glm.hpp>
 
 #include "Entity.h"
 #include "Light.h"
@@ -44,10 +45,23 @@ public:
     ShadingModel getShadingModel() const               { return m_shadingModel; }
     void         setShadingModel(ShadingModel model)   { m_shadingModel = model; }
 
+    // Returns the light-view-projection matrix of the first shadow-casting light
+    // found during the most recent update(), or identity if none exist. Used by
+    // the Renderer's shadow pass and by pass4 to sample the shadow map.
+    const glm::mat4& getShadowViewProjection() const { return m_shadowViewProjection; }
+
+    // Index (into lights[]) of the shadow-casting light, or -1 if none.
+    // pass4 uses this to know which light's contribution should be modulated by the shadow factor.
+    int getShadowLightIndex() const { return m_shadowLightIndex; }
+
 private:
     GLuint       m_ssbo        = 0;                       // GL SSBO handle (0 = not yet created)
     int          m_lightCount  = 0;                       // Number of lights in the current upload
     ShadingModel m_shadingModel = ShadingModel::BlinnPhong; // Current shading model selection
+
+    // Cached during update(): the first shadow-casting light's VP matrix and index.
+    glm::mat4 m_shadowViewProjection = glm::mat4(1.0f);
+    int       m_shadowLightIndex     = -1;
 };
 
 #endif // LIGHT_MANAGER_H

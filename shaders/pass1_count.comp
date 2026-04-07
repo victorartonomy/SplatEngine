@@ -24,9 +24,14 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 const int TILE_SIZE = 16;
 
 // Vertex: world-space position + smooth normal (std430 layout — see Mesh.h for padding)
+// 48-byte Vertex — pass1 only reads position, but layout must match C++ Vertex for
+// correct SSBO stride.
 struct Vertex {
-    vec3 position;
-    vec3 normal;
+    vec3  position;
+    vec3  normal;
+    vec2  uv;
+    float _p0;
+    float _p1;
 };
 
 // Face: indices into the vertex buffer + per-face color + material ID (std430 layout — see Mesh.h)

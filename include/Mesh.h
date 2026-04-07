@@ -9,11 +9,15 @@
 //   - vec3 in std430 has 16-byte alignment, so a float pad follows each vec3.
 //   - Total struct size = 32 bytes (2 × 16-byte aligned slots).
 struct Vertex {
-    glm::vec3 position; // World-space position of this vertex (transformed at submitScene time)
-    float _pad0;        // Padding: rounds position+float to 16 bytes as required by std430
-    glm::vec3 normal;   // Smooth per-vertex normal (computed by COFFParser, then transformed by normal matrix)
-    float _pad1;        // Padding: keeps struct size a multiple of 16 bytes
+    glm::vec3 position;  // bytes  0–11: world-space position (set at submitScene time)
+    float     _pad0;     // bytes 12–15: std430 alignment pad after vec3
+    glm::vec3 normal;    // bytes 16–27: smooth per-vertex normal (computed by COFFParser)
+    float     _pad1;     // bytes 28–31: std430 alignment pad after vec3
+    glm::vec2 uv;        // bytes 32–39: texture coordinates (planar XY projection in COFFParser)
+    float     _pad2;     // bytes 40–43: explicit pad so struct size is a multiple of 16
+    float     _pad3;     // bytes 44–47: explicit pad so struct size is a multiple of 16
 };
+static_assert(sizeof(Vertex) == 48, "Vertex must be 48 bytes for std430");
 
 // Face — one triangle entry in the face SSBO uploaded to the GPU.
 // Layout must exactly match the GLSL struct in all compute shaders (std430 rules):
@@ -37,7 +41,7 @@ struct GPUMaterial {
     float     metallic;  // bytes 12–15: 0=dielectric, 1=full metal (PBR Cook-Torrance only)
     float     roughness; // bytes 16–19: 0=mirror smooth, 1=fully diffuse (PBR only)
     float     emissive;  // bytes 20–23: emissive intensity; final += albedo × emissive
-    float     _pad0;     // bytes 24–27: explicit padding to reach 32-byte struct size
+    int       textureID; // bytes 24–27: -1 = no texture; 0+ = layer index into GL_TEXTURE_2D_ARRAY
     float     _pad1;     // bytes 28–31: explicit padding to reach 32-byte struct size
 };
 static_assert(sizeof(GPUMaterial) == 32, "GPUMaterial must be 32 bytes for std430");

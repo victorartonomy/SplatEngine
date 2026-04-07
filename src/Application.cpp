@@ -232,6 +232,7 @@ void Application::update() {
         ImGui::DockBuilderDockWindow("Camera Settings",   dockRightBottom); // Lower-right: camera/lighting
         ImGui::DockBuilderDockWindow("Lighting",          dockRightBottom); // Tabbed with Camera Settings
         ImGui::DockBuilderDockWindow("Materials",         dockRightBottom); // Tabbed with Camera Settings
+        ImGui::DockBuilderDockWindow("Textures",          dockRightBottom); // Tabbed with Camera Settings
         ImGui::DockBuilderDockWindow("Mouse",             dockRightBottom); // Tabbed with Camera Settings
         ImGui::DockBuilderFinish(dockspaceId);
     }
@@ -692,7 +693,7 @@ void Application::update() {
             newMat.metallic  = 0.0f;
             newMat.roughness = 0.5f;
             newMat.emissive  = 0.0f;
-            newMat._pad0     = 0.0f;
+            newMat.textureID = -1;
             newMat._pad1     = 0.0f;
             m_selectedMaterial = static_cast<int>(
                 m_renderer.getMaterialManager().addMaterial(newMat));
@@ -725,11 +726,72 @@ void Application::update() {
             changed |= ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
             changed |= ImGui::SliderFloat("Emissive",  &mat.emissive,  0.0f, 10.0f);
 
+            // Texture selector: "None" or one of the loaded texture layers
+            {
+                int texCount = m_renderer.getTextureManager().getTextureCount();
+                std::string preview = "None";
+                if (mat.textureID >= 0 && mat.textureID < texCount) {
+                    const std::string& p = m_renderer.getTextureManager().getTexturePath(mat.textureID);
+                    size_t slash = p.find_last_of("/\\");
+                    preview = (slash != std::string::npos) ? p.substr(slash + 1) : p;
+                }
+
+                if (ImGui::BeginCombo("Texture", preview.c_str())) {
+                    bool noneSelected = (mat.textureID < 0);
+                    if (ImGui::Selectable("None", noneSelected)) { mat.textureID = -1; changed = true; }
+                    if (noneSelected) ImGui::SetItemDefaultFocus();
+
+                    for (int t = 0; t < texCount; t++) {
+                        const std::string& p = m_renderer.getTextureManager().getTexturePath(t);
+                        size_t slash = p.find_last_of("/\\");
+                        std::string tname = (slash != std::string::npos) ? p.substr(slash + 1) : p;
+                        bool sel = (mat.textureID == t);
+                        if (ImGui::Selectable(tname.c_str(), sel)) { mat.textureID = t; changed = true; }
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
             if (changed) {
                 m_renderer.getMaterialManager().setMaterial(
                     static_cast<uint32_t>(m_selectedMaterial), mat);
                 m_renderer.getMaterialManager().upload();  // Push to GPU immediately
             }
+        }
+    }
+    ImGui::End();
+
+    // =============================================
+    // TEXTURES WINDOW
+    // =============================================
+    ImGui::Begin("Textures");
+    {
+        int texCount = m_renderer.getTextureManager().getTextureCount();
+        ImGui::Text("Textures (%d)", texCount);
+        ImGui::Separator();
+
+        if (ImGui::Button("Load Texture...")) {
+            nfdu8char_t* outPath = nullptr;
+            nfdu8filteritem_t filters[1] = { { "Image Files", "png,jpg,jpeg,tga,bmp" } };
+            nfdresult_t result = NFD_OpenDialogU8(&outPath, filters, 1, nullptr);
+            if (result == NFD_OKAY && outPath) {
+                int layerIdx = m_renderer.getTextureManager().addTexture(outPath);
+                if (layerIdx >= 0)
+                    m_renderer.getTextureManager().upload();
+                NFD_FreePathU8(outPath);
+            } else if (result == NFD_ERROR) {
+                std::cerr << "[ERROR] NFD: " << NFD_GetError() << std::endl;
+            }
+        }
+
+        ImGui::Separator();
+
+        for (int i = 0; i < texCount; i++) {
+            const std::string& path = m_renderer.getTextureManager().getTexturePath(i);
+            size_t slash = path.find_last_of("/\\");
+            std::string name = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+            ImGui::Text("%d: %s", i, name.c_str());
         }
     }
     ImGui::End();

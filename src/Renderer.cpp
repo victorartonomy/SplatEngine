@@ -48,6 +48,29 @@ GLuint Renderer::createDepthBuffer(int width, int height) {
     return texture;
 }
 
+// Create the shadow map texture — a square R32UI image used by the shadow pass.
+//
+// We use R32UI (not R32F) because GLSL's imageAtomicMin only works on integer images.
+// shadow_pass.comp bit-casts its float depth values to uints with floatBitsToUint(),
+// which is monotonic for non-negative floats, so atomicMin on the bit pattern correctly
+// selects the closest light-space surface.
+//
+// NEAREST filtering is mandatory for integer formats. Clamp-to-edge prevents edge
+// fetches from sampling phantom data when a fragment lies just outside the light frustum.
+GLuint Renderer::createShadowMap(int size) {
+    GLuint texture;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, size, size, 0,
+                 GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return texture;
+}
+
 // ============================================
 // INITIALIZE
 // ============================================
@@ -68,11 +91,15 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
     m_pass3Shader      = std::make_unique<ComputeShader>("shaders/pass3_bin.comp");
     m_pass4Shader      = std::make_unique<ComputeShader>("shaders/pass4_rasterize_tiled.comp");
     m_debugTilesShader = std::make_unique<ComputeShader>("shaders/debug_tiles.comp");
+    // Shadow mapping shaders.
+    m_clearShadowShader = std::make_unique<ComputeShader>("shaders/clear_shadow.comp");
+    m_shadowPassShader  = std::make_unique<ComputeShader>("shaders/shadow_pass.comp");
 
     if (!m_clearDepthShader->isValid() || !m_clearTilesShader->isValid() ||
         !m_pass1Shader->isValid()      || !m_pass2Shader->isValid()      ||
         !m_pass3Shader->isValid()      || !m_pass4Shader->isValid()      ||
-        !m_debugTilesShader->isValid()) {
+        !m_debugTilesShader->isValid() ||
+        !m_clearShadowShader->isValid() || !m_shadowPassShader->isValid()) {
         std::cerr << "[ERROR] Renderer: one or more compute shaders failed to compile" << std::endl;
         return false;
     }
@@ -82,6 +109,10 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
     m_outputTexture  = createOutputTexture(viewportWidth, viewportHeight);
     m_depthBuffer    = createDepthBuffer(viewportWidth, viewportHeight);
 
+    // Shadow map is fixed-resolution, so it's created once here and never resized
+    // in response to viewport changes.
+    m_shadowMapTexture = createShadowMap(m_shadowMapSize);
+
     m_tileRasterizer = std::make_unique<TileRasterizer>(viewportWidth, viewportHeight);
     m_tileRasterizer->initialize(1); // Placeholder — resized on first mesh load
 
@@ -89,6 +120,10 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
     // All faces parsed from COFF files are assigned materialID=0, so existing meshes
     // render identically: face.color × albedo(1,1,1) = face.color.
     m_materialManager.upload();
+
+    // Upload the dummy 1×1 white texture array so pass4's "textureAtlas" sampler uniform
+    // is always bound to a complete, valid texture object even before any user textures load.
+    m_textureManager.upload();
 
     return true;
 }
@@ -101,11 +136,13 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
 // LightManager must be shut down before the GL context is destroyed (it owns an SSBO).
 // ComputeShader unique_ptrs reset here, calling their destructors and glDeleteProgram.
 void Renderer::shutdown() {
-    glDeleteTextures(1, &m_outputTexture); m_outputTexture = 0;
-    glDeleteTextures(1, &m_depthBuffer);   m_depthBuffer   = 0;
+    glDeleteTextures(1, &m_outputTexture);    m_outputTexture    = 0;
+    glDeleteTextures(1, &m_depthBuffer);      m_depthBuffer      = 0;
+    glDeleteTextures(1, &m_shadowMapTexture); m_shadowMapTexture = 0;
 
     m_lightManager.shutdown();
     m_materialManager.shutdown();
+    m_textureManager.shutdown();
     m_tileRasterizer.reset();
     m_clearDepthShader.reset();
     m_clearTilesShader.reset();
@@ -114,6 +151,8 @@ void Renderer::shutdown() {
     m_pass3Shader.reset();
     m_pass4Shader.reset();
     m_debugTilesShader.reset();
+    m_clearShadowShader.reset();
+    m_shadowPassShader.reset();
 }
 
 // ============================================
@@ -248,6 +287,39 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
 
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
+    // --- Phase 0.5: Shadow Pass ---
+    // Render scene depth from the perspective of the primary shadow-casting light
+    // into m_shadowMapTexture. pass4 will sample this map per-pixel to darken
+    // surfaces that are occluded from the light.
+    //
+    // We rebuild the light SSBO here (rather than later, just before pass4) so we
+    // can read the cached light-view-projection matrix immediately. The SSBO is
+    // safe to update at this point — no compute pass between here and pass4 reads it.
+    m_lightManager.update(scene.getEntities());
+    glm::mat4 shadowVP = m_lightManager.getShadowViewProjection();
+
+    // 1) Clear the shadow map texture to 0xFFFFFFFF (= max depth).
+    m_clearShadowShader->use();
+    glBindImageTexture(0, m_shadowMapTexture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+    GLuint shadowGroups = (m_shadowMapSize + 15) / 16;
+    m_clearShadowShader->dispatch(shadowGroups, shadowGroups, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    // 2) Rasterise scene depth from the light's point of view.
+    //    One thread per triangle, atomicMin into the shadow map.
+    m_shadowPassShader->use();
+    m_mergedGpuBuffer.bindVertexBuffer(0); // VertexBuffer at binding 0
+    m_mergedGpuBuffer.bindFaceBuffer(1);   // FaceBuffer at binding 1
+    glBindImageTexture(2, m_shadowMapTexture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    m_shadowPassShader->setMat4 ("lightViewProjection", shadowVP);
+    m_shadowPassShader->setIVec2("shadowMapSize",
+                                 glm::ivec2(m_shadowMapSize, m_shadowMapSize));
+    GLuint numShadowTriGroups =
+        (static_cast<GLuint>(m_mergedMesh.getFaceCount()) + 255) / 256;
+    m_shadowPassShader->dispatch(numShadowTriGroups, 1, 1);
+    // Make subsequent reads (in pass4) see the shadow-map writes.
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+
     // --- Phase 1: Project & Count ---
     // Each thread processes one triangle. It projects all 3 vertices to screen space,
     // computes the screen-space AABB, and atomically increments the counter for every tile
@@ -349,8 +421,7 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
         m_debugTilesShader->setIVec2("screenSize", glm::ivec2(m_viewportWidth, m_viewportHeight));
         m_debugTilesShader->dispatch(numGroupsX, numGroupsY, 1);
     } else if (totalPairs > 0) {
-        // Update and bind the GPU light SSBO before dispatching pass4
-        m_lightManager.update(scene.getEntities());
+        // (Light SSBO was already updated above before the shadow pass — don't re-upload.)
 
         m_pass4Shader->use();
         // Binding layout for pass4_rasterize_tiled.comp:
@@ -362,8 +433,12 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
         //   SSBO binding 5: tile offset buffer (prefix sum output)
         //   SSBO binding 6: triangle list buffer (binning output)
         //   SSBO binding 7: light buffer (GPULight array)
-        glBindImageTexture(0, m_outputTexture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
-        glBindImageTexture(1, m_depthBuffer,   0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+        glBindImageTexture(0, m_outputTexture,    0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+        glBindImageTexture(1, m_depthBuffer,      0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+        // Shadow map at image unit 2 — image units are a separate namespace from SSBO
+        // bindings, and most GPUs cap GL_MAX_IMAGE_UNITS at 8. Units 0/1 already hold
+        // the output color and depth images.
+        glBindImageTexture(2, m_shadowMapTexture, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32UI);
         m_mergedGpuBuffer.bindVertexBuffer(2);
         m_mergedGpuBuffer.bindFaceBuffer(3);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, m_tileRasterizer->getProjectedTriangleBufferID());
@@ -371,6 +446,10 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_tileRasterizer->getTriangleListBufferID());
         m_lightManager.bind(7);
         m_materialManager.bind(8);  // binding 8: GPUMaterial array
+
+        // Bind the texture array to unit 0 and point the sampler uniform at it.
+        m_textureManager.bind(0);
+        m_pass4Shader->setInt("textureAtlas", 0);
 
         m_pass4Shader->setIVec2("screenSize",
                                 glm::ivec2(m_viewportWidth, m_viewportHeight));
@@ -381,6 +460,14 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
         m_pass4Shader->setInt("numMaterials", m_materialManager.getMaterialCount());
         m_pass4Shader->setVec3("cameraPos",   camera.getPosition());
         m_pass4Shader->setInt("shadingModel", static_cast<int>(m_lightManager.getShadingModel()));
+
+        // Shadow mapping uniforms — pass4 uses these to project worldPos into the
+        // shadow map and apply a binary occlusion factor to the matching light.
+        m_pass4Shader->setMat4 ("shadowViewProjection", shadowVP);
+        m_pass4Shader->setIVec2("shadowMapSize",
+                                glm::ivec2(m_shadowMapSize, m_shadowMapSize));
+        m_pass4Shader->setInt  ("shadowLightIndex", m_lightManager.getShadowLightIndex());
+
         m_pass4Shader->dispatch(numGroupsX, numGroupsY, 1);
     } else {
         // No visible geometry — fill with a dark background color via CPU upload.

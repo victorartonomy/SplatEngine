@@ -1,0 +1,29 @@
+#version 430 core
+
+// clear_shadow.comp — Phase 0c: Reset the shadow map to "infinitely far".
+//
+// The shadow map is an R32UI image (single-channel 32-bit unsigned integer) that
+// stores per-texel light-space depth. shadow_pass.comp later writes to it with
+// imageAtomicMin so the *closest* surface (smallest uint) wins for every texel.
+//
+// Like the main depth buffer, we initialise every texel to 0xFFFFFFFF — the
+// maximum uint32, which represents "farthest possible depth". Any subsequent
+// atomicMin from a real triangle is guaranteed to replace it.
+//
+// One invocation per texel, dispatched as a 16×16 grid covering the full map.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Bound at image unit 0 (GL_WRITE_ONLY) by Renderer::render() before this dispatch.
+layout(r32ui, binding = 0) uniform uimage2D shadowMap;
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size   = imageSize(shadowMap);
+
+    // Guard against the over-spawned threads at the edge of a non-multiple-of-16 size.
+    if (coords.x < size.x && coords.y < size.y) {
+        // 0xFFFFFFFF = max uint = sentinel "no surface here yet".
+        imageStore(shadowMap, coords, uvec4(0xFFFFFFFFu));
+    }
+}

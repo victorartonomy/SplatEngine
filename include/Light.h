@@ -31,21 +31,27 @@ struct Light {
 };
 
 // GPULight — std430-compatible struct uploaded to SSBO binding 7.
-// Must be exactly 64 bytes (4 × 16-byte vec4-aligned slots).
+// Must be exactly 128 bytes (8 × 16-byte vec4-aligned slots).
 // Each vec3 is followed by a float to satisfy std430's 16-byte vec3 alignment rule.
+//
+// Layout grew from 64 → 128 bytes when shadow mapping was added: a full mat4
+// (lightViewProjection) plus a castsShadow flag are now baked into every light.
+// The matrix is computed on the CPU in toGPULight() so the shader can transform
+// world-space positions into the shadow map's clip space without extra uniforms.
 struct GPULight {
-    glm::vec3 position;       // bytes  0-11: world-space position (used by point/spot)
-    float     type;           // bytes 12-15: LightType cast to float (avoids int alignment edge cases)
-    glm::vec3 direction;      // bytes 16-27: unit vector pointing away from the light source
-    float     intensity;      // bytes 28-31
-    glm::vec3 color;          // bytes 32-43: linear RGB
-    float     range;          // bytes 44-47: falloff distance for point/spot
-    float     innerCosAngle;  // bytes 48-51: cos(innerCone) — pre-computed to avoid trig in shader
-    float     outerCosAngle;  // bytes 52-55: cos(outerCone) — ditto
-    float     _pad0;          // bytes 56-59: explicit padding to reach 64 bytes
-    float     _pad1;          // bytes 60-63
+    glm::vec3 position;       // bytes   0- 11: world-space position (used by point/spot)
+    float     type;           // bytes  12- 15: LightType cast to float (avoids int alignment edge cases)
+    glm::vec3 direction;      // bytes  16- 27: unit vector pointing away from the light source
+    float     intensity;      // bytes  28- 31
+    glm::vec3 color;          // bytes  32- 43: linear RGB
+    float     range;          // bytes  44- 47: falloff distance for point/spot
+    float     innerCosAngle;  // bytes  48- 51: cos(innerCone) — pre-computed to avoid trig in shader
+    float     outerCosAngle;  // bytes  52- 55: cos(outerCone) — ditto
+    float     castsShadow;    // bytes  56- 59: 1.0 if this light casts shadows, 0.0 otherwise
+    float     _pad0;          // bytes  60- 63: pad to vec4 boundary
+    glm::mat4 lightViewProjection; // bytes 64-127: shadow map clip-space matrix (light VP)
 };
-static_assert(sizeof(GPULight) == 64, "GPULight must be 64 bytes for std430");
+static_assert(sizeof(GPULight) == 128, "GPULight must be 128 bytes for std430");
 
 // toGPULight — converts a CPU Light + Transform into a GPU-ready GPULight.
 // Called by LightManager::update() for every light entity in the scene.
@@ -70,8 +76,33 @@ inline GPULight toGPULight(const Light& light, const Transform& transform) {
     // instead of calling acos(). cos(innerCone) > cos(outerCone) since smaller angle → larger cosine.
     g.innerCosAngle = std::cos(glm::radians(light.innerCone));
     g.outerCosAngle = std::cos(glm::radians(light.outerCone));
+
+    // ---- Shadow mapping support ----
+    // Currently only directional lights cast shadows. Spot/point lights would need a
+    // perspective projection (and a cube map for points), which is out of scope here.
+    if (light.type == LightType::Directional) {
+        g.castsShadow = 1.0f;
+
+        // Place a virtual "camera" far back along the negation of the light direction so
+        // the entire scene fits in the orthographic frustum below. 100 units is a generous
+        // distance that keeps the near plane in front of typical scenes (≤ ~100 unit radius).
+        glm::vec3 lightPos = -g.direction * 100.0f;
+        glm::vec3 up       = glm::vec3(0.0f, 1.0f, 0.0f);
+        // Pick an alternate up vector if the light is shining straight down — otherwise
+        // lookAt's cross product collapses and the resulting matrix is degenerate.
+        if (std::abs(glm::dot(g.direction, up)) > 0.99f)
+            up = glm::vec3(0.0f, 0.0f, 1.0f);
+
+        glm::mat4 lightView = glm::lookAt(lightPos, glm::vec3(0.0f), up);
+        // Orthographic frustum: ±50 units in X/Y, near 0.1 / far 200. Tweak if scenes grow.
+        glm::mat4 lightProj = glm::ortho(-50.0f, 50.0f, -50.0f, 50.0f, 0.1f, 200.0f);
+        g.lightViewProjection = lightProj * lightView;
+    } else {
+        g.castsShadow         = 0.0f;
+        g.lightViewProjection = glm::mat4(1.0f);
+    }
+
     g._pad0 = 0.0f;
-    g._pad1 = 0.0f;
     return g;
 }
 
