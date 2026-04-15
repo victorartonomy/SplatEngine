@@ -172,3 +172,44 @@ Image units and SSBO binding points are **separate namespaces**. `GL_MAX_IMAGE_U
 4. Bind SSBOs/images and dispatch in `Renderer::render()` at the correct phase
 5. Release in `Renderer::shutdown()`
 6. Shaders are auto-copied to the build output directory on rebuild
+
+## SplatVault — Knowledge Base
+
+The Obsidian vault at `SplatVault/` is a living second brain for this project. **After every code change, update the relevant vault notes.**
+
+### Vault Path
+`D:\Create\Applications\SplatEngine\SplatVault\`
+
+### What to Update After Each Change
+
+| Change Made | Vault Notes to Update |
+|-------------|----------------------|
+| Add/rename/remove a field in `Vertex`, `Face`, `GPUMaterial`, `GPULight`, or `ProjectedTriangle` | `Mesh.md`, `Light.md`, `TileData.md`, `GPU Memory Layout.md`, every shader note that declares the struct |
+| Add a new SSBO or change an existing binding point | `SSBO Binding Map.md`, every shader note that uses that binding |
+| Add a new compute shader | Create `04 - Shaders/<shader_name>.md`; update `Renderer.md`, `Rendering Pipeline.md`, `Home.md` |
+| Add a new C++ class or header | Create `03 - Source Files/<ClassName>.md`; update `Architecture Overview.md`, `Home.md` |
+| Change the rendering pipeline order or add/remove a phase | `Rendering Pipeline.md`, the Mermaid flowchart in `Home.md` |
+| Change `TILE_SIZE` in `TileData.h` | `TileData.md`, `Tiled Rasterization.md`, all shader notes that mention `local_size_x/y` |
+| Add a new light type or shading model | `Light.md`, `LightManager.md`, `PBR Shading.md`, `pass4_rasterize_tiled.md` |
+| Change the OIT/transparency algorithm | `Transparency (WBOIT).md`, `pass4_rasterize_tiled.md`, `pass5_oit_composite.md` |
+| Add a new event type to `Events.h` | `Events.md` |
+| Change shadow map resolution, algorithm, or bias | `Shadow Mapping.md`, `shadow_pass.md`, `clear_shadow.md`, `Light.md` |
+| Add or remove a manager (LightManager, MaterialManager, etc.) | The manager's note + `Renderer.md`, `Architecture Overview.md` |
+
+### Vault Structure Reminder
+
+```
+SplatVault/
+├── Home.md                   ← Master index + pipeline Mermaid
+├── 00 - Meta/                ← Conventions, update protocol
+├── 01 - Architecture/        ← Pipeline, SSBO map, GPU layout, system overview
+├── 02 - Concepts/            ← WBOIT, shadow, PBR, tiling, Blelloch
+├── 03 - Source Files/        ← One note per .h/.cpp pair
+└── 04 - Shaders/             ← One note per .comp file
+```
+
+### WikiLink Naming
+
+- C++ class → exact class name: `[[Renderer]]`, `[[LightManager]]`
+- Shader → filename without `.comp`: `[[pass4_rasterize_tiled]]`
+- Concept → full title: `[[Transparency (WBOIT)]]`, `[[Tiled Rasterization]]`

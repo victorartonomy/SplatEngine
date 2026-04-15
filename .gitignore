@@ -51,3 +51,5 @@ Thumbs.db
 # Ignore ImGui ini file
 imgui.ini
 /models
+/SplatVault/.obsidian
+*.md
