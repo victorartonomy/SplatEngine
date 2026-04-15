@@ -1,0 +1,130 @@
+#version 430 core
+
+// pass6_fxaa.comp — Phase 5: Fast Approximate Anti-Aliasing (post-process).
+//
+// Runs after pass5's OIT composite. Samples the fully-composited scene (opaque + transparent)
+// from `srcImage` and writes an edge-smoothed result to `dstImage`. When FXAA is disabled on
+// the CPU side this dispatch is skipped entirely and the raw output is presented directly.
+//
+// This is a compact port of FXAA 3.11's "console quality" path:
+//   - 1 center + 4 N/E/S/W luma samples drive an early-out against a local-contrast threshold.
+//   - 4 diagonal samples feed edge-direction classification (horizontal vs vertical gradient).
+//   - A single offset tap along the detected edge normal is blended with the center by a
+//     subpixel-contrast weight. No iterative edge-walk — fast and divergence-light.
+//
+// Why a sampler2D (not image2D) for the source?
+//   FXAA leans on bilinear filtering for its half-pixel offset tap. Image loads are nearest
+//   only, so we bind the pass5 output to texture unit 0 (GL_LINEAR, GL_CLAMP_TO_EDGE) and
+//   fetch with texture()/textureOffset().
+//
+// Binding namespaces:
+//   texture sampler unit 0  -> srcImage
+//   image unit          0  -> dstImage  (separate namespace, no conflict)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Source: scene color written by pass5 (RGBA32F, GL_LINEAR filtering).
+layout(binding = 0) uniform sampler2D srcImage;
+
+// Destination: presentation image sampled by ImGui.
+layout(rgba32f, binding = 0) uniform writeonly image2D dstImage;
+
+// Viewport dimensions. Inverse resolution is computed here to avoid adding a setVec2
+// helper to ComputeShader — the rest of the pipeline already passes screenSize as ivec2.
+uniform ivec2 screenSize;
+
+// Subpixel-contrast blend strength in [0, 1]. Higher values remove more sub-pixel aliasing
+// at the cost of softening fine detail. 0.75 matches FXAA's default.
+uniform float uQualitySubpix;
+
+// Relative local-contrast threshold. Any pixel whose luma range is below
+// max(uEdgeThresholdMin, lumaMax * uEdgeThreshold) is copied through unchanged.
+//   0.333 = too little  (misses real edges)
+//   0.166 = default     (balanced)
+//   0.125 = high quality
+//   0.063 = overkill    (smooths near-flat regions too)
+uniform float uEdgeThreshold;
+
+// Absolute dark-scene cutoff. Prevents FXAA from blurring faint noise in dark regions where
+// relative contrast would otherwise trip the threshold.
+//   0.0833 = default (fast)
+//   0.0625 = high quality
+//   0.0312 = very high quality (slower, amplifies faint gradients)
+uniform float uEdgeThresholdMin;
+
+// Rec.601 luma — cheaper than rec.709 and visually indistinguishable for AA purposes.
+float rgb2luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= screenSize.x || pix.y >= screenSize.y) return;
+
+    vec2 invRes = 1.0 / vec2(screenSize);
+    vec2 uv     = (vec2(pix) + 0.5) * invRes;
+
+    // --- Center + 4-tap cross for the early-out test ---
+    vec3 rgbM  = texture(srcImage, uv).rgb;
+    float lumaM = rgb2luma(rgbM);
+    float lumaN = rgb2luma(textureOffset(srcImage, uv, ivec2( 0,  1)).rgb);
+    float lumaS = rgb2luma(textureOffset(srcImage, uv, ivec2( 0, -1)).rgb);
+    float lumaE = rgb2luma(textureOffset(srcImage, uv, ivec2( 1,  0)).rgb);
+    float lumaW = rgb2luma(textureOffset(srcImage, uv, ivec2(-1,  0)).rgb);
+
+    float lumaMin = min(lumaM, min(min(lumaN, lumaS), min(lumaE, lumaW)));
+    float lumaMax = max(lumaM, max(max(lumaN, lumaS), max(lumaE, lumaW)));
+    float range   = lumaMax - lumaMin;
+
+    // Not an edge — pass through.
+    if (range < max(uEdgeThresholdMin, lumaMax * uEdgeThreshold)) {
+        imageStore(dstImage, pix, vec4(rgbM, 1.0));
+        return;
+    }
+
+    // --- Diagonals for edge-direction classification ---
+    float lumaNW = rgb2luma(textureOffset(srcImage, uv, ivec2(-1,  1)).rgb);
+    float lumaNE = rgb2luma(textureOffset(srcImage, uv, ivec2( 1,  1)).rgb);
+    float lumaSW = rgb2luma(textureOffset(srcImage, uv, ivec2(-1, -1)).rgb);
+    float lumaSE = rgb2luma(textureOffset(srcImage, uv, ivec2( 1, -1)).rgb);
+
+    // Sobel-like gradient magnitudes. A strong horizontal edge means luma changes fastest
+    // vertically between neighbours, so we step along the y axis, and vice versa.
+    float edgeH = abs(lumaNW + lumaNE - 2.0 * lumaN)
+                + 2.0 * abs(lumaW + lumaE - 2.0 * lumaM)
+                + abs(lumaSW + lumaSE - 2.0 * lumaS);
+    float edgeV = abs(lumaNW + lumaSW - 2.0 * lumaW)
+                + 2.0 * abs(lumaN + lumaS - 2.0 * lumaM)
+                + abs(lumaNE + lumaSE - 2.0 * lumaE);
+    bool horzEdge = edgeH >= edgeV;
+
+    // Step direction along the edge normal. Pick the steeper of the two neighbour gradients
+    // so we move toward the *higher-contrast* side — that's where the anti-aliased tap lives.
+    float stepSize = horzEdge ? invRes.y : invRes.x;
+    float luma1    = horzEdge ? lumaS : lumaW;
+    float luma2    = horzEdge ? lumaN : lumaE;
+    float grad1    = luma1 - lumaM;
+    float grad2    = luma2 - lumaM;
+    bool  steep1   = abs(grad1) >= abs(grad2);
+    float stepLen  = steep1 ? -stepSize : stepSize;
+
+    // --- Subpixel weight ---
+    // Compare the 3×3 low-frequency average to the center luma. Large deltas mean the
+    // center is a subpixel feature (thin detail / single-pixel stair step) that benefits
+    // from softer blending. smoothstep + square gives FXAA's characteristic falloff.
+    float lumaAvg = (1.0 / 12.0) * (
+        2.0 * (lumaN + lumaS + lumaE + lumaW) +
+        (lumaNW + lumaNE + lumaSW + lumaSE));
+    float subpix = clamp(abs(lumaAvg - lumaM) / range, 0.0, 1.0);
+    subpix = (subpix * subpix) * (3.0 - 2.0 * subpix);       // smoothstep
+    subpix = subpix * subpix * uQualitySubpix;
+
+    // --- Offset tap + blend ---
+    // Half a pixel along the step direction lets bilinear filtering blend two pixels on
+    // the high-contrast side for free — this is the core of FXAA's edge smoothing.
+    vec2 offset = horzEdge ? vec2(0.0, stepLen) : vec2(stepLen, 0.0);
+    vec3 rgbEdge = texture(srcImage, uv + offset * 0.5).rgb;
+
+    vec3 rgbFinal = mix(rgbM, rgbEdge, subpix);
+    imageStore(dstImage, pix, vec4(rgbFinal, 1.0));
+}

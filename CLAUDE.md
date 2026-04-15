@@ -10,8 +10,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Configure (first time only)
 "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -B build -G "Visual Studio 18 2026" -A x64
 
-# Build (Release)
-"C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe" build\Engine.vcxproj /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+# Build (Release) — use -p: instead of /p: under Git Bash; leading slashes get path-mangled
+"C:/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" build/Engine.vcxproj -p:Configuration=Release -p:Platform=x64 -m -v:minimal
 
 # Run
 build\Release\Engine.exe
@@ -38,7 +38,8 @@ This is a **Triangle Splatting** renderer — a compute-shader-only rendering en
 | 2: Bin | `pass3_bin.comp` | Scatter triangle IDs into per-tile lists using prefix-sum offsets |
 | 3: Rasterize | `pass4_rasterize_tiled.comp` | Per-pixel edge tests, depth/normal/position interpolation, Blinn-Phong or PBR shading, WBOIT accumulation for transparent fragments |
 | 4: OIT Composite | `pass5_oit_composite.comp` | Blend the weighted transparent layer over the opaque output image |
-| 5: Display | ImGui viewport | Sample output texture and present |
+| 5: FXAA | `pass6_fxaa.comp` | Post-process anti-aliasing; samples `outputImage`, writes `presentationImage`. Skipped when `m_fxaaEnabled` is false |
+| 6: Display | ImGui viewport | Sample `getDisplayTexture()` (presentation if FXAA on, else output) and present |
 
 ### Transparency System (WBOIT)
 
@@ -75,7 +76,7 @@ Synchronous pub/sub via `EventBus.h/cpp`:
 | TextureManager | `TextureManager.h/cpp` | Owns the `GL_TEXTURE_2D_ARRAY` sampled in pass4 as `textureAtlas` |
 | TileRasterizer | `TileRasterizer.h/cpp` | Allocates/resizes the 6 tiling pipeline SSBOs; handles prefix-sum CPU readback |
 | COFFParser | `COFFParser.h/cpp` | Loads OFF/COFF files, computes smooth per-vertex normals (area-weighted), generates planar UVs |
-| ComputeShader | `ComputeShader.h/cpp` | Loads `.comp` files; uniform API: `setInt/UInt/Float/Vec3/IVec2/Mat4` |
+| ComputeShader | `ComputeShader.h/cpp` | Loads `.comp` files; uniform API: `setInt/UInt/Float/Vec3/IVec2/Mat4` — **no `setVec2`**; pass screen-size as `ivec2` and compute `1.0/vec2(screenSize)` in the shader |
 | AssetManager | `AssetManager.h/cpp` | Mesh loading, caching, ref-counting, async support |
 | Entity | `Entity.h` | Transform + optional mesh + optional `Light` (`std::optional<Light>`) |
 | Camera | `Camera.h/cpp` | FPS 6DOF (quaternion), orbit mode, bookmarks |
@@ -106,6 +107,13 @@ Synchronous pub/sub via `EventBus.h/cpp`:
 | 2 | TileOffsetBuffer |
 | 3 | TriangleListBuffer |
 | 4 | TileWriteOffsetBuffer |
+
+### pass6_fxaa.comp
+Uses no SSBOs. Sampler texture units and image units are separate namespaces, so `binding = 0` is used on both without conflict.
+| Binding | Type | Buffer/Image |
+|---------|------|-------------|
+| sampler unit 0 | `sampler2D` (RGBA32F) | srcImage — bound to `m_outputTexture`, bilinear fetches |
+| image unit 0   | `image2D` (RGBA32F)   | dstImage — bound to `m_presentationTexture`, write-only |
 
 ### pass4_rasterize_tiled.comp + pass5_oit_composite.comp
 | Binding | Type | Buffer/Image |
@@ -152,6 +160,7 @@ Image units and SSBO binding points are **separate namespaces**. `GL_MAX_IMAGE_U
 
 - **Rasterization / shading / transparency:** `pass4_rasterize_tiled.comp` (opaque + WBOIT accumulation)
 - **OIT compositing formula:** `pass5_oit_composite.comp`
+- **FXAA tuning:** `pass6_fxaa.comp` (edge thresholds, subpixel blend). Runtime state lives on `Renderer` (`m_fxaaEnabled`, `m_fxaaQualitySubpix`, `m_fxaaEdgeThreshold`, `m_fxaaEdgeThresholdMin`)
 - **Material parameters (CPU side):** `Mesh.h` (`GPUMaterial`), `MaterialManager.cpp` (defaults)
 - **Material UI:** search `ImGui::Begin("Materials")` in `Application.cpp`
 - **Light types and GPU struct:** `Light.h` — must keep `GPULight` at 128 bytes and update GLSL struct to match
@@ -163,6 +172,7 @@ Image units and SSBO binding points are **separate namespaces**. `GL_MAX_IMAGE_U
 - **Render pipeline orchestration:** `Renderer.cpp`
 - **Event system:** `EventBus.h` (subscribe/publish), `Events.h` (event structs)
 - **Entity structure:** `Entity.h` (add new optional components here)
+- **Display texture selection for ImGui:** `Renderer::getDisplayTexture()` — returns `m_presentationTexture` when FXAA is enabled, else `m_outputTexture`. The viewport `ImGui::Image` call in `Application.cpp` goes through this getter
 
 ## Adding a New Shader
 
@@ -172,3 +182,13 @@ Image units and SSBO binding points are **separate namespaces**. `GL_MAX_IMAGE_U
 4. Bind SSBOs/images and dispatch in `Renderer::render()` at the correct phase
 5. Release in `Renderer::shutdown()`
 6. Shaders are auto-copied to the build output directory on rebuild
+
+## Adding a New ImGui Panel
+
+`Application.cpp` uses **ImGui docking** with an explicit layout built via `DockBuilderDockWindow` (search the `m_firstLoop` block — runs on every launch). A new `ImGui::Begin("X")` without a matching `DockBuilderDockWindow("X", ...)` becomes a free-floating window that often stacks behind others and looks missing.
+
+1. Add the panel with `ImGui::Begin("PanelName") / ImGui::End()` somewhere in the render loop.
+2. Add `ImGui::DockBuilderDockWindow("PanelName", dockRightBottom)` (or another node) to the initial dock layout block — the window title must match exactly.
+3. Viewport render targets are separate from the output texture in general; sample via `m_renderer.getDisplayTexture()` for anything that should respect post-process toggles.
+
+Resizeable viewport render targets must be re-created in `Renderer::resize()`; forgetting this will crash on window resize (see how `m_outputTexture` and `m_presentationTexture` are handled).

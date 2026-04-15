@@ -122,6 +122,8 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
     m_pass4Shader      = std::make_unique<ComputeShader>("shaders/pass4_rasterize_tiled.comp");
     // OIT composite pass: blend transparent fragments over the opaque output image.
     m_pass5OITShader   = std::make_unique<ComputeShader>("shaders/pass5_oit_composite.comp");
+    // FXAA post-process (runs after pass5 when m_fxaaEnabled is true).
+    m_pass6FXAAShader  = std::make_unique<ComputeShader>("shaders/pass6_fxaa.comp");
     m_debugTilesShader = std::make_unique<ComputeShader>("shaders/debug_tiles.comp");
     // Shadow mapping shaders.
     m_clearShadowShader = std::make_unique<ComputeShader>("shaders/clear_shadow.comp");
@@ -130,7 +132,8 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
     if (!m_clearDepthShader->isValid()  || !m_clearTilesShader->isValid()  ||
         !m_pass1Shader->isValid()       || !m_pass2Shader->isValid()       ||
         !m_pass3Shader->isValid()       || !m_pass4Shader->isValid()       ||
-        !m_pass5OITShader->isValid()    || !m_debugTilesShader->isValid()  ||
+        !m_pass5OITShader->isValid()    || !m_pass6FXAAShader->isValid()   ||
+        !m_debugTilesShader->isValid()  ||
         !m_clearShadowShader->isValid() || !m_shadowPassShader->isValid()) {
         std::cerr << "[ERROR] Renderer: one or more compute shaders failed to compile" << std::endl;
         return false;
@@ -140,6 +143,9 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
     m_viewportHeight = viewportHeight;
     m_outputTexture  = createOutputTexture(viewportWidth, viewportHeight);
     m_depthBuffer    = createDepthBuffer(viewportWidth, viewportHeight);
+    // FXAA destination — same format/filter/wrap as m_outputTexture so bilinear fetches
+    // in pass6 behave identically regardless of which texture is sampled.
+    m_presentationTexture = createOutputTexture(viewportWidth, viewportHeight);
 
     // Shadow map is fixed-resolution, so it's created once here and never resized
     // in response to viewport changes.
@@ -172,9 +178,10 @@ bool Renderer::initialize(int viewportWidth, int viewportHeight) {
 // LightManager must be shut down before the GL context is destroyed (it owns an SSBO).
 // ComputeShader unique_ptrs reset here, calling their destructors and glDeleteProgram.
 void Renderer::shutdown() {
-    glDeleteTextures(1, &m_outputTexture);    m_outputTexture    = 0;
-    glDeleteTextures(1, &m_depthBuffer);      m_depthBuffer      = 0;
-    glDeleteTextures(1, &m_shadowMapTexture); m_shadowMapTexture = 0;
+    glDeleteTextures(1, &m_outputTexture);       m_outputTexture       = 0;
+    glDeleteTextures(1, &m_presentationTexture); m_presentationTexture = 0;
+    glDeleteTextures(1, &m_depthBuffer);         m_depthBuffer         = 0;
+    glDeleteTextures(1, &m_shadowMapTexture);    m_shadowMapTexture    = 0;
 
     // Release OIT accumulation SSBOs
     GLuint oitBufs[] = { m_oitAccumR, m_oitAccumG, m_oitAccumB, m_oitAccumA, m_oitReveal };
@@ -192,6 +199,7 @@ void Renderer::shutdown() {
     m_pass3Shader.reset();
     m_pass4Shader.reset();
     m_pass5OITShader.reset();
+    m_pass6FXAAShader.reset();
     m_debugTilesShader.reset();
     m_clearShadowShader.reset();
     m_shadowPassShader.reset();
@@ -207,11 +215,13 @@ void Renderer::shutdown() {
 void Renderer::resize(int newWidth, int newHeight) {
     glFinish(); // Wait for GPU to complete any ongoing compute dispatches
     glDeleteTextures(1, &m_outputTexture);
+    glDeleteTextures(1, &m_presentationTexture);
     glDeleteTextures(1, &m_depthBuffer);
     m_viewportWidth  = newWidth;
     m_viewportHeight = newHeight;
-    m_outputTexture  = createOutputTexture(newWidth, newHeight);
-    m_depthBuffer    = createDepthBuffer(newWidth, newHeight);
+    m_outputTexture       = createOutputTexture(newWidth, newHeight);
+    m_presentationTexture = createOutputTexture(newWidth, newHeight);
+    m_depthBuffer         = createDepthBuffer(newWidth, newHeight);
     // OIT buffers are per-pixel so they must match the new viewport dimensions exactly.
     createOITBuffers(newWidth, newHeight);
     if (!m_mergedMesh.faces.empty())
@@ -558,7 +568,39 @@ void Renderer::render(Scene& scene, const Camera& camera, const AssetManager& am
         glBindTexture(GL_TEXTURE_2D, 0);
     }
 
-    // GL_TEXTURE_FETCH_BARRIER_BIT ensures that imageStore writes from pass4 are visible
-    // when ImGui samples the texture with a texture fetch (glBindTexture / GLSL texture()).
+    // Sync image writes from pass5 / debug path so the following texture fetches see them.
+    // Required before pass6 samples m_outputTexture, and before ImGui samples whichever
+    // texture getDisplayTexture() returns when FXAA is disabled.
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    // --- Phase 5: FXAA (pass6_fxaa.comp) ---
+    // Post-process over the fully composited image. Reads m_outputTexture through a sampler
+    // (bilinear + clamp-to-edge, configured in createOutputTexture) and writes the smoothed
+    // result to m_presentationTexture. When disabled we skip the dispatch entirely and
+    // getDisplayTexture() returns m_outputTexture — zero GPU cost in the off state.
+    //
+    // Sampler unit 0 (srcImage) and image unit 0 (dstImage) occupy separate namespaces,
+    // so using binding slot 0 for both is legal and unambiguous.
+    if (m_fxaaEnabled) {
+        m_pass6FXAAShader->use();
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_outputTexture);
+        m_pass6FXAAShader->setInt("srcImage", 0);
+
+        glBindImageTexture(0, m_presentationTexture, 0, GL_FALSE, 0,
+                           GL_WRITE_ONLY, GL_RGBA32F);
+
+        m_pass6FXAAShader->setIVec2("screenSize",
+                                    glm::ivec2(m_viewportWidth, m_viewportHeight));
+        m_pass6FXAAShader->setFloat("uQualitySubpix",    m_fxaaQualitySubpix);
+        m_pass6FXAAShader->setFloat("uEdgeThreshold",    m_fxaaEdgeThreshold);
+        m_pass6FXAAShader->setFloat("uEdgeThresholdMin", m_fxaaEdgeThresholdMin);
+
+        m_pass6FXAAShader->dispatch(numGroupsX, numGroupsY, 1);
+
+        // pass6's imageStore into m_presentationTexture must be visible to ImGui's
+        // subsequent texture fetch.
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    }
 }
