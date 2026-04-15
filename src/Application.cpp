@@ -233,6 +233,7 @@ void Application::update() {
         ImGui::DockBuilderDockWindow("Lighting",          dockRightBottom); // Tabbed with Camera Settings
         ImGui::DockBuilderDockWindow("Materials",         dockRightBottom); // Tabbed with Camera Settings
         ImGui::DockBuilderDockWindow("Textures",          dockRightBottom); // Tabbed with Camera Settings
+        ImGui::DockBuilderDockWindow("Anti-Aliasing",     dockRightBottom); // Tabbed with Camera Settings
         ImGui::DockBuilderDockWindow("Mouse",             dockRightBottom); // Tabbed with Camera Settings
         ImGui::DockBuilderFinish(dockspaceId);
     }
@@ -309,7 +310,7 @@ void Application::update() {
         // --- Display compute output ---
         // UV coordinates (0,1) → (1,0) flip the V axis because OpenGL textures have origin
         // at bottom-left while ImGui's image origin is top-left.
-        ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(m_renderer.getOutputTexture())),
+        ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(m_renderer.getDisplayTexture())),
                      ImVec2(static_cast<float>(m_renderer.getViewportWidth()),
                             static_cast<float>(m_renderer.getViewportHeight())),
                      ImVec2(0, 1), ImVec2(1, 0));
@@ -674,6 +675,33 @@ void Application::update() {
                 m_selectedEntity = i; // Cross-select: clicking a light here selects it in the hierarchy
             ImGui::PopID();
         }
+    }
+    ImGui::End();
+
+    // =============================================
+    // ANTI-ALIASING WINDOW
+    // =============================================
+    ImGui::Begin("Anti-Aliasing");
+    {
+        bool fxaa = m_renderer.getFXAAEnabled();
+        if (ImGui::Checkbox("FXAA", &fxaa))
+            m_renderer.setFXAAEnabled(fxaa);
+
+        ImGui::BeginDisabled(!fxaa);
+        float subpix = m_renderer.getFXAAQualitySubpix();
+        if (ImGui::SliderFloat("Subpixel strength", &subpix, 0.0f, 1.0f, "%.2f"))
+            m_renderer.setFXAAQualitySubpix(subpix);
+
+        float edge = m_renderer.getFXAAEdgeThreshold();
+        if (ImGui::SliderFloat("Edge threshold", &edge, 0.063f, 0.333f, "%.3f"))
+            m_renderer.setFXAAEdgeThreshold(edge);
+
+        float edgeMin = m_renderer.getFXAAEdgeThresholdMin();
+        if (ImGui::SliderFloat("Edge threshold min", &edgeMin, 0.0312f, 0.0833f, "%.4f"))
+            m_renderer.setFXAAEdgeThresholdMin(edgeMin);
+        ImGui::EndDisabled();
+
+        ImGui::TextDisabled("Defaults: 0.75 / 0.166 / 0.0833");
     }
     ImGui::End();
 
